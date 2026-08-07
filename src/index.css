@@ -1,0 +1,51 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  }
+
+  code, pre, .font-mono {
+    font-family: 'Fira Code', monospace;
+  }
+}
+
+/* Custom scrollbar for VS Code feel */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: #1e1e1e;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #3e3e42;
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #55555c;
+}
+
+.syntax-keyword { color: #569CD6; font-weight: 600; }
+.syntax-type { color: #4EC9B0; font-weight: 500; }
+.syntax-string { color: #CE9178; }
+.syntax-number { color: #B5CEA8; }
+.syntax-comment { color: #6A9955; font-style: italic; }
+.syntax-function { color: #DCDCAA; font-weight: 500; }
+.syntax-variable { color: #9CDCFE; }
+.syntax-operator { color: #D4D4D4; }
+.syntax-preprocessor { color: #C586C0; font-weight: 500; }
+
+@keyframes pulseGlow {
+  0%, 100% { box-shadow: 0 0 10px rgba(86, 156, 214, 0.3); }
+  50% { box-shadow: 0 0 20px rgba(86, 156, 214, 0.7); }
+}
+
+.glow-active {
+  animation: pulseGlow 2s infinite;
+}
