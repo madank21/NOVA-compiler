@@ -18,11 +18,13 @@ typedef struct Scope {
     int level;
     char name[64];
     struct Scope* parent;
+    struct Scope* next;
 } Scope;
 
 typedef struct {
     Scope* current_scope;
     Scope* global_scope;
+    Scope* scope_list;
     int total_symbols;
     int error_count;
 } SymbolTable;

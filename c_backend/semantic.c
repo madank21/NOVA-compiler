@@ -3,8 +3,10 @@
 static Scope* create_scope(const char* name, int level, Scope* parent) {
     Scope* s = (Scope*)calloc(1, sizeof(Scope));
     strncpy(s->name, name, 63);
+    s->name[63] = '\0';
     s->level = level;
     s->parent = parent;
+    s->next = NULL;
     return s;
 }
 
@@ -23,8 +25,11 @@ static Symbol* lookup_symbol_scope(Scope* scope, const char* name) {
 static void add_symbol_scope(Scope* scope, const char* name, const char* type, int is_func, int param_count) {
     Symbol* sym = (Symbol*)calloc(1, sizeof(Symbol));
     strncpy(sym->name, name, 255);
+    sym->name[255] = '\0';
     strncpy(sym->type, type, 63);
+    sym->type[63] = '\0';
     sym->scope_level = scope->level;
+    sym->address = 0;
     sym->is_function = is_func;
     sym->param_count = param_count;
     sym->next = scope->symbols;
@@ -78,6 +83,7 @@ static void traverse_ast_semantic(ASTNode* node, SymbolTable* st) {
 SymbolTable* semantic_analyze(ASTNode* root) {
     SymbolTable* st = (SymbolTable*)calloc(1, sizeof(SymbolTable));
     st->global_scope = create_scope("global", 0, NULL);
+    st->scope_list = st->global_scope;
     st->current_scope = st->global_scope;
 
     // Add built-ins
@@ -100,8 +106,12 @@ static void free_scope(Scope* s) {
 }
 
 void symbol_table_free(SymbolTable* st) {
-    if (st) {
-        if (st->global_scope) free_scope(st->global_scope);
-        free(st);
+    if (!st) return;
+    Scope* scope = st->scope_list;
+    while (scope) {
+        Scope* next = scope->next;
+        free_scope(scope);
+        scope = next;
     }
+    free(st);
 }
