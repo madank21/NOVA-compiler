@@ -36,8 +36,56 @@ export function compileCSource(sourceCode, userInputs = []) {
   const endTime = performance.now();
   const compileTimeMs = Math.max(1.2, parseFloat((endTime - startTime).toFixed(2)));
 
+  // Basic diagnostics: bracket balance and simple undefined-identifier checks
+  const diagnostics = [];
+
+  function checkBrackets(src) {
+    const stack = [];
+    const pairs = { ')': '(', '}': '{', ']': '[' };
+    for (let i = 0; i < src.length; i++) {
+      const ch = src[i];
+      if (ch === '(' || ch === '{' || ch === '[') stack.push({ ch, i });
+      if (ch === ')' || ch === '}' || ch === ']') {
+        if (!stack.length || stack[stack.length - 1].ch !== pairs[ch]) {
+          diagnostics.push({ level: 'error', msg: `Unmatched '${ch}' at column ${i}` });
+          return;
+        }
+        stack.pop();
+      }
+    }
+    if (stack.length) diagnostics.push({ level: 'error', msg: `Unmatched '${stack[stack.length - 1].ch}'` });
+  }
+
+  checkBrackets(sourceCode);
+
+  // Simple undefined identifier detection: find identifiers used in RHS of assignments
+  try {
+    const declared = new Set((symbolTable || []).map(s => s.name));
+    const assignRegex = /([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*([^;]+)/g;
+    let m;
+    while ((m = assignRegex.exec(sourceCode)) !== null) {
+      const lhs = m[1];
+      const rhs = m[2];
+      const idRegex = /\b([a-zA-Z_][a-zA-Z0-9_]*)\b/g;
+      let idm;
+      while ((idm = idRegex.exec(rhs)) !== null) {
+        const name = idm[1];
+        if (name === lhs) continue;
+        if (C_KEYWORDS.has(name) || C_TYPES.has(name)) continue;
+        if (['printf', 'scanf'].includes(name)) continue;
+        if (!declared.has(name) && !/^\d+$/.test(name)) {
+          diagnostics.push({ level: 'error', msg: `Undefined identifier '${name}' in expression for '${lhs}'` });
+        }
+      }
+    }
+  } catch (e) {
+    diagnostics.push({ level: 'warning', msg: 'Failed to run undefined-identifier analysis' });
+  }
+
+  const success = diagnostics.length === 0;
+
   return {
-    success: true,
+    success,
     compile_time_ms: compileTimeMs,
     tokens,
     ast,
@@ -49,7 +97,8 @@ export function compileCSource(sourceCode, userInputs = []) {
     vmTrace: vmResult.steps,
     waitingForInput: vmResult.waitingForInput,
     inputPrompt: vmResult.inputPrompt,
-    consoleOutput: vmResult.consoleOutput
+    consoleOutput: vmResult.consoleOutput,
+    diagnostics
   };
 }
 
