@@ -58,7 +58,24 @@ export function compileCSource(sourceCode, userInputs = []) {
 
   checkBrackets(sourceCode);
 
-  // Simple undefined identifier detection: find identifiers used in RHS of assignments
+  // Unsupported feature detection for the browser engine demo
+  const unsupportedPatterns = [
+    { regex: /\bif\s*\(/, msg: 'Unsupported control-flow construct: if' },
+    { regex: /\bfor\s*\(/, msg: 'Unsupported control-flow construct: for' },
+    { regex: /\bwhile\s*\(/, msg: 'Unsupported control-flow construct: while' },
+    { regex: /\bstruct\b/, msg: 'Unsupported language construct: struct' },
+    { regex: /\b(?:int|float|double|char|void)\s+(?!main\b)[a-zA-Z_][a-zA-Z0-9_]*\s*\([^\)]*\)\s*\{/, msg: 'Unsupported function definition or call semantics' },
+    { regex: /\b[a-zA-Z_][a-zA-Z0-9_]*\s*\[\s*[0-9]*\s*\]/, msg: 'Unsupported array syntax' },
+    { regex: /\*\s*[a-zA-Z_][a-zA-Z0-9_]*/, msg: 'Unsupported pointer/dereference syntax' },
+    { regex: /&\s*[a-zA-Z_][a-zA-Z0-9_]*/, msg: 'Unsupported address-of operator' }
+  ];
+
+  unsupportedPatterns.forEach((pattern) => {
+    if (pattern.regex.test(sourceCode)) {
+      diagnostics.push({ level: 'error', msg: pattern.msg });
+    }
+  });
+ 
   try {
     const declared = new Set((symbolTable || []).map(s => s.name));
     const assignRegex = /([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*([^;]+)/g;

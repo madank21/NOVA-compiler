@@ -5,6 +5,7 @@ export default function ConsoleOutput({
   consoleText,
   compileTimeMs,
   isSuccess,
+  diagnostics = [],
   onInputSubmit,
   height,
   onHeightChange,
@@ -92,12 +93,17 @@ export default function ConsoleOutput({
           )}
         </div>
         <div className="flex items-center space-x-3 text-[11px]">
-          {isSuccess && !waitingForInput && (
+          {isSuccess && !waitingForInput ? (
             <span className="flex items-center space-x-1 text-emerald-400">
               <CheckCircle2 className="w-3.5 h-3.5" />
               <span>Execution Finished ({compileTimeMs} ms)</span>
             </span>
-          )}
+          ) : !waitingForInput ? (
+            <span className="flex items-center space-x-1 text-rose-400">
+              <CheckCircle2 className="w-3.5 h-3.5" />
+              <span>Compile Failed ({compileTimeMs} ms)</span>
+            </span>
+          ) : null}
         </div>
       </div>
 
@@ -106,6 +112,17 @@ export default function ConsoleOutput({
         ref={consoleBottomRef}
         className="flex-1 p-3 overflow-auto text-gray-300 whitespace-pre-wrap selection:bg-blue-500/30 font-mono text-xs leading-5"
       >
+        {diagnostics.length > 0 && (
+          <div className="mb-3 rounded border border-rose-500/30 bg-rose-950/30 p-3 text-rose-200">
+            <div className="text-[11px] uppercase tracking-[0.2em] text-rose-300 font-bold mb-2">Diagnostics</div>
+            {diagnostics.map((diag, idx) => (
+              <div key={idx} className="mb-1 text-[12px]">
+                <span className="font-semibold">{diag.level.toUpperCase()}:</span> {diag.msg}
+              </div>
+            ))}
+          </div>
+        )}
+
         {consoleText || '[Console Ready — Click "Compile & Run" to execute code]'}
       </div>
 
