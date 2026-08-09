@@ -176,6 +176,7 @@ export default function App() {
         consoleText={compileResult?.consoleOutput || ''}
         compileTimeMs={compileResult?.compile_time_ms || 3.2}
         isSuccess={compileResult?.success !== false}
+        diagnostics={compileResult?.diagnostics || []}
         onInputSubmit={handleTerminalInput}
         height={consoleHeight}
         onHeightChange={setConsoleHeight}
