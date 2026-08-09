@@ -14,10 +14,13 @@ $(TARGET): $(OBJS)
 $(SERVER_TARGET): $(SERVER_SRCS)
 	$(CC) $(CFLAGS) -o $@ $^ -lws2_32
 
+test_native: $(OBJS) native_test.o
+	$(CC) $(CFLAGS) -o nova_native_test $^
+
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 clean:
-	rm -f *.o $(TARGET) $(SERVER_TARGET) $(TARGET).exe $(SERVER_TARGET).exe
+	rm -f *.o $(TARGET) $(SERVER_TARGET) $(TARGET).exe $(SERVER_TARGET).exe nova_native_test
 
-.PHONY: all clean
+.PHONY: all clean test_native

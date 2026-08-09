@@ -7,7 +7,10 @@
     "dev": "vite",
     "build": "vite build",
     "lint": "eslint .",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test:engine": "node tests/run_engine_test.mjs",
+    "test:c-backend": "cd c_backend && make test_native",
+    "test": "npm run test:engine"
   },
   "dependencies": {
     "lucide-react": "^0.460.0",
