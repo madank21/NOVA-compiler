@@ -1,26 +1,47 @@
-CC = gcc
-CFLAGS = -Wall -Wextra -O2 -I.
-SRCS = lexer.c parser.c semantic.c tac.c optimizer.c bytecode.c vm.c json.c main.c
-SERVER_SRCS = lexer.c parser.c semantic.c tac.c optimizer.c bytecode.c vm.c json.c server.c
-OBJS = $(SRCS:.c=.o)
-TARGET = nova_compiler
-SERVER_TARGET = nova_server
+CC ?= gcc
+CFLAGS ?= -std=c99 -Wall -Wextra -O2
+CPPFLAGS += -D_POSIX_C_SOURCE=200809L -I.
 
-all: $(TARGET) $(SERVER_TARGET)
+# Windows (MinGW) needs ws2_32 for sockets; Linux/macOS do not.
+ifeq ($(OS),Windows_NT)
+  SERVER_LIBS := -lws2_32
+else
+  SERVER_LIBS :=
+  UNAME_S := $(shell uname -s)
+  ifeq ($(UNAME_S),Darwin)
+    SERVER_LIBS :=
+  else
+    SERVER_LIBS += -lpthread
+  endif
+endif
 
-$(TARGET): $(OBJS)
-	$(CC) $(CFLAGS) -o $@ $^
+COMMON_SRCS := lexer.c parser.c semantic.c tac.c optimizer.c bytecode.c vm.c json.c compile.c diag.c fmt.c
+COMMON_OBJS := $(COMMON_SRCS:.c=.o)
 
-$(SERVER_TARGET): $(SERVER_SRCS)
-	$(CC) $(CFLAGS) -o $@ $^ -lws2_32
+all: nova_compiler nova_server
 
-test_native: $(OBJS) native_test.o
-	$(CC) $(CFLAGS) -o nova_native_test $^
+nova_compiler: main.o $(COMMON_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) -lm
+
+nova_server: server.o $(COMMON_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) $(SERVER_LIBS) -lm
+
+# Native test harness (its own main; COMMON_OBJS excludes main.o)
+check: nova_native_test
+	./nova_native_test
+
+nova_native_test: native_test.o $(COMMON_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) -lm
+
+test_native: check
 
 %.o: %.c
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
+
+asan:
+	$(MAKE) CFLAGS="-std=c99 -Wall -Wextra -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer" all nova_native_test
 
 clean:
-	rm -f *.o $(TARGET) $(SERVER_TARGET) $(TARGET).exe $(SERVER_TARGET).exe nova_native_test
+	rm -f *.o nova_compiler nova_server nova_native_test *.exe
 
-.PHONY: all clean test_native
+.PHONY: all check test_native asan clean

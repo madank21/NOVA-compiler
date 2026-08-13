@@ -1,34 +1,53 @@
-#ifndef TAC_H
-#define TAC_H
+#ifndef NOVA_TAC_H
+#define NOVA_TAC_H
 
 #include "parser.h"
+#include "semantic.h"
 
-typedef enum {
-    TAC_ADD, TAC_SUB, TAC_MUL, TAC_DIV, TAC_MOD,
-    TAC_ASSIGN, TAC_LABEL, TAC_GOTO, TAC_IF_FALSE, TAC_IF_TRUE,
-    TAC_PARAM, TAC_CALL, TAC_RETURN, TAC_FUNC_BEGIN, TAC_FUNC_END,
-    TAC_PRINT, TAC_NOP
-} TACOpcode;
-
-typedef struct TACInstr {
-    TACOpcode op;
-    char result[64];
-    char arg1[64];
-    char arg2[64];
+typedef struct {
+    char op[12];
+    char res[64];
+    char a1[64];
+    char a2[64];
     int line;
-    struct TACInstr* next;
 } TACInstr;
 
 typedef struct {
-    TACInstr* head;
-    TACInstr* tail;
-    int temp_count;
-    int label_count;
+    TACInstr* items;
     int count;
+    int capacity;
 } TACList;
 
-TACList* generate_tac(ASTNode* root);
-void tac_list_free(TACList* list);
-const char* tac_op_to_string(TACOpcode op);
+/* temp name -> declared type ("int" / "double" / "ptr") */
+typedef struct {
+    char name[32];
+    char type[16];
+} TempType;
 
-#endif // TAC_H
+typedef struct {
+    TempType* items;
+    int count;
+    int capacity;
+} TempTypeList;
+
+typedef struct {
+    char** items;
+    int count;
+    int capacity;
+} StrList;
+
+typedef struct {
+    TACList* instrs;
+    TempTypeList temp_types;
+    StrList strings; /* string constant pool (printf formats) */
+    int temp_count;
+    int label_count;
+} TACGen;
+
+TACGen* generate_tac(ASTNode* ast, SemModel* sem, DiagList* diags, StrPool* pool);
+void tac_gen_free(TACGen* g);
+void tac_list_free(TACList* list);
+TACList* tac_list_clone(const TACList* list);
+const char* temp_type_of(const TempTypeList* l, const char* name);
+
+#endif

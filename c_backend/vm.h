@@ -1,48 +1,52 @@
-#ifndef VM_H
-#define VM_H
+#ifndef NOVA_VM_H
+#define NOVA_VM_H
 
 #include "bytecode.h"
 
-#define STACK_MAX 256
-#define VARS_MAX 64
+#define VM_MEM_MAX 65536
+#define VM_STACK_MAX 4096
+#define VM_CALL_DEPTH_MAX 1024
+#define VM_MAX_STEPS 200000
+#define VM_TRACE_MAX_STEPS 2000
 
 typedef struct {
-    char name[64];
-    int value;
-} VMVariable;
+    char name[256];
+    double value;
+} VMVarSnap;
 
 typedef struct {
+    char func[260];
+    char ret_addr[16];
+} VMFrameSnap;
+
+typedef struct {
+    int step;
     int pc;
-    int operand_stack[STACK_MAX];
-    int stack_top;
-
-    char call_stack[16][64];
-    int call_top;
-
-    VMVariable variables[VARS_MAX];
-    int var_count;
-
-    char console_output[2048];
     int line;
+    char* instruction;
+    double* stack;
+    int stack_count;
+    VMVarSnap* variables;
+    int var_count;
+    VMFrameSnap* frames;
+    int frame_count;
+    char* console;
 } VMStep;
 
 typedef struct {
     VMStep* steps;
     int count;
     int capacity;
-} VMExecutionTrace;
+    int truncated;
+    char* console_output;   /* final output (owned) */
+    int waiting_for_input;
+    char input_prompt[256];
+    int exit_code;
+    DiagList* runtime_diags; /* borrowed, diags appended here */
+} VMResult;
 
-typedef struct {
-    BytecodeChunk* chunk;
-    int pc;
-    int stack[STACK_MAX];
-    int sp;
-    VMVariable vars[VARS_MAX];
-    int var_count;
-    char console[2048];
-} VM;
+VMResult* vm_execute(const BytecodeChunk* chunk, SemModel* sem,
+                     const char** inputs, int input_count, DiagList* diags);
+void vm_result_free(VMResult* r);
 
-VMExecutionTrace* vm_execute(BytecodeChunk* chunk);
-void vm_trace_free(VMExecutionTrace* trace);
-
-#endif // VM_H
+#endif

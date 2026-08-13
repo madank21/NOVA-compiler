@@ -1,47 +1,46 @@
-#ifndef BYTECODE_H
-#define BYTECODE_H
+#ifndef NOVA_BYTECODE_H
+#define NOVA_BYTECODE_H
 
 #include "tac.h"
+#include "semantic.h"
 
-typedef enum {
-    OP_PUSH,
-    OP_POP,
-    OP_LOAD,
-    OP_STORE,
-    OP_ADDR,
-    OP_LOAD_PTR,
-    OP_STORE_PTR,
-    OP_LOAD_ARRAY,
-    OP_STORE_ARRAY,
-    OP_ADD,
-    OP_SUB,
-    OP_MUL,
-    OP_DIV,
-    OP_CMP_EQ,
-    OP_CMP_LT,
-    OP_JMP,
-    OP_JZ,
-    OP_CALL,
-    OP_RET,
-    OP_PRINT,
-    OP_HALT
-} Opcode;
-
+/* Serialized JSON fields: pc, op, operand, symbol, line.
+ * The remaining fields are internal (slot layout, fixups) and are identical
+ * across the JS and C engines. */
 typedef struct {
-    Opcode op;
-    int operand;
+    int pc;
+    char op[12];
+    double operand;
     char symbol[64];
     int line;
-} Instruction;
+    /* internal */
+    int slot;
+    int is_global;
+    int fmt_idx;
+    int array_size;
+    char target_label[64];
+    int has_fixup;
+} BInstr;
+
+typedef struct { char name[256]; int pc; } FuncEntry;
+typedef struct { char name[64]; int pc; } LabelEntry;
+typedef struct { char name[256]; int temps; } TempsEntry;
 
 typedef struct {
-    Instruction* code;
+    BInstr* code;
     int count;
     int capacity;
+    const StrList* strings;   /* borrowed from TACGen */
+    FuncEntry* funcs;   int func_count, func_cap;
+    LabelEntry* labels; int label_count, label_cap;
+    TempsEntry* temps_by_func; int tbf_count, tbf_cap;
 } BytecodeChunk;
 
-BytecodeChunk* generate_bytecode(TACList* tac_list);
+BytecodeChunk* generate_bytecode(const TACList* opt_tac, SemModel* sem,
+                                 const TempTypeList* temp_types, const StrList* strings,
+                                 DiagList* diags);
 void bytecode_chunk_free(BytecodeChunk* chunk);
-const char* opcode_to_string(Opcode op);
+int chunk_func_pc(const BytecodeChunk* chunk, const char* name);
+int chunk_temps_for(const BytecodeChunk* chunk, const char* name);
 
-#endif // BYTECODE_H
+#endif

@@ -1,15 +1,15 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Terminal, CheckCircle2, Send, GripHorizontal, RotateCcw, HelpCircle, Loader2 } from 'lucide-react';
+import { Terminal, CheckCircle2, XCircle, Send, GripHorizontal, Loader2, Clock } from 'lucide-react';
 
 export default function ConsoleOutput({
   consoleText,
   compileTimeMs,
   isSuccess,
+  hasResult,
   diagnostics = [],
   onInputSubmit,
   height,
   onHeightChange,
-  terminalInputs = [],
   waitingForInput = false,
   inputPrompt = ''
 }) {
@@ -27,103 +27,106 @@ export default function ConsoleOutput({
     if (waitingForInput && inputRef.current) {
       inputRef.current.focus();
     }
-  }, [consoleText, terminalInputs, waitingForInput]);
+  }, [consoleText, waitingForInput]);
 
   const handleMouseDown = (e) => {
     isDraggingRef.current = true;
     startYRef.current = e.clientY;
     startHeightRef.current = height;
-    document.addEventListener('mousemove', handleMouseMove);
-    document.addEventListener('mouseup', handleMouseUp);
-  };
-
-  const handleMouseMove = (e) => {
-    if (!isDraggingRef.current) return;
-    const deltaY = startYRef.current - e.clientY;
-    const newHeight = Math.min(550, Math.max(120, startHeightRef.current + deltaY));
-    onHeightChange(newHeight);
-  };
-
-  const handleMouseUp = () => {
-    isDraggingRef.current = false;
-    document.removeEventListener('mousemove', handleMouseMove);
-    document.removeEventListener('mouseup', handleMouseUp);
+    const move = (ev) => {
+      if (!isDraggingRef.current) return;
+      const deltaY = startYRef.current - ev.clientY;
+      const newHeight = Math.min(550, Math.max(120, startHeightRef.current + deltaY));
+      onHeightChange(newHeight);
+    };
+    const up = () => {
+      isDraggingRef.current = false;
+      document.removeEventListener('mousemove', move);
+      document.removeEventListener('mouseup', up);
+    };
+    document.addEventListener('mousemove', move);
+    document.addEventListener('mouseup', up);
   };
 
   const handleSendInput = (e) => {
     e.preventDefault();
     if (!inputText.trim()) return;
-
     const val = inputText.trim();
     setInputText('');
+    if (onInputSubmit) onInputSubmit(val);
+  };
 
-    if (onInputSubmit) {
-      onInputSubmit(val);
-    }
+  const diagColor = (level) => {
+    if (level === 'error') return 'text-rose-300';
+    if (level === 'runtime') return 'text-orange-300';
+    return 'text-yellow-300';
   };
 
   return (
     <div
       style={{ height: `${height}px` }}
-      className="bg-[#181818] border-t border-[#333333] flex flex-col font-mono text-xs relative select-none"
+      className="bg-[#181818] border-t border-[#333333] flex flex-col font-mono text-xs relative"
     >
       {/* Resizable Drag Handle Bar */}
       <div
         onMouseDown={handleMouseDown}
         className="h-2 w-full bg-[#252526] border-b border-[#333333] hover:bg-blue-500/30 cursor-row-resize flex items-center justify-center transition group"
-        title="Drag up/down to resize output area"
+        title="Drag up/down to resize the output area"
       >
-        <GripHorizontal className="w-4 h-3 text-gray-500 group-hover:text-blue-400" />
+        <GripHorizontal aria-hidden="true" className="w-4 h-3 text-gray-500 group-hover:text-blue-400" />
       </div>
 
       {/* Console Header Bar */}
       <div className="bg-[#252526] px-4 py-1.5 border-b border-[#333333] flex items-center justify-between text-gray-400 select-none shrink-0">
         <div className="flex items-center space-x-2">
-          <Terminal className="w-3.5 h-3.5 text-blue-400" />
-          <span className="font-bold text-gray-200 text-[11px]">Interactive Terminal & Output</span>
-          {waitingForInput ? (
+          <Terminal aria-hidden="true" className="w-3.5 h-3.5 text-blue-400" />
+          <span className="font-bold text-gray-200 text-[11px]">Program Output &amp; Interactive Terminal</span>
+          {waitingForInput && (
             <span className="flex items-center space-x-1 bg-amber-500/20 text-amber-400 border border-amber-500/40 px-2 py-0.5 rounded text-[10px] font-bold animate-pulse">
-              <Loader2 className="w-3 h-3 animate-spin" />
-              <span>Waiting for User Input...</span>
-            </span>
-          ) : (
-            <span className="text-[10px] bg-blue-500/20 text-blue-400 border border-blue-500/30 px-1.5 py-0.2 rounded font-mono">
-              Dev-C++ / IDE Terminal Style
+              <Loader2 aria-hidden="true" className="w-3 h-3 animate-spin" />
+              <span>Waiting for input…</span>
             </span>
           )}
         </div>
-        <div className="flex items-center space-x-3 text-[11px]">
-          {isSuccess && !waitingForInput ? (
+        <div className="flex items-center space-x-3 text-[11px]" role="status" aria-live="polite">
+          {!hasResult ? (
+            <span className="flex items-center space-x-1 text-gray-400">
+              <Clock aria-hidden="true" className="w-3.5 h-3.5" />
+              <span>Ready</span>
+            </span>
+          ) : isSuccess && !waitingForInput ? (
             <span className="flex items-center space-x-1 text-emerald-400">
-              <CheckCircle2 className="w-3.5 h-3.5" />
-              <span>Execution Finished ({compileTimeMs} ms)</span>
+              <CheckCircle2 aria-hidden="true" className="w-3.5 h-3.5" />
+              <span>Execution finished{typeof compileTimeMs === 'number' ? ` (${compileTimeMs} ms)` : ''}</span>
             </span>
           ) : !waitingForInput ? (
             <span className="flex items-center space-x-1 text-rose-400">
-              <CheckCircle2 className="w-3.5 h-3.5" />
-              <span>Compile Failed ({compileTimeMs} ms)</span>
+              <XCircle aria-hidden="true" className="w-3.5 h-3.5" />
+              <span>Compilation failed{typeof compileTimeMs === 'number' ? ` (${compileTimeMs} ms)` : ''}</span>
             </span>
           ) : null}
         </div>
       </div>
 
-      {/* Terminal Content Stream */}
+      {/* Terminal Content Stream — text is selectable so output can be copied */}
       <div
         ref={consoleBottomRef}
-        className="flex-1 p-3 overflow-auto text-gray-300 whitespace-pre-wrap selection:bg-blue-500/30 font-mono text-xs leading-5"
+        className="flex-1 p-3 overflow-auto text-gray-300 whitespace-pre-wrap select-text selection:bg-blue-500/30 font-mono text-xs leading-5"
       >
         {diagnostics.length > 0 && (
           <div className="mb-3 rounded border border-rose-500/30 bg-rose-950/30 p-3 text-rose-200">
             <div className="text-[11px] uppercase tracking-[0.2em] text-rose-300 font-bold mb-2">Diagnostics</div>
             {diagnostics.map((diag, idx) => (
               <div key={idx} className="mb-1 text-[12px]">
-                <span className="font-semibold">{diag.level.toUpperCase()}:</span> {diag.msg}
+                <span className={`font-semibold ${diagColor(diag.level)}`}>{diag.level.toUpperCase()}</span>
+                {diag.line > 0 && <span className="text-rose-400/70"> (line {diag.line}{diag.column > 0 ? `, col ${diag.column}` : ''})</span>}
+                : {diag.msg}
               </div>
             ))}
           </div>
         )}
 
-        {consoleText || '[Console Ready — Click "Compile & Run" to execute code]'}
+        {consoleText || (diagnostics.length === 0 ? '[No output — compile a program to run it]' : '')}
       </div>
 
       {/* Interactive Input Prompt (scanf / stdin) */}
@@ -135,20 +138,22 @@ export default function ConsoleOutput({
             : 'bg-[#1e1e1e] border-t border-[#333333]'
         }`}
       >
-        <span className={`font-bold font-mono text-xs select-none ${
+        <label htmlFor="scanf-input" className={`font-bold font-mono text-xs select-none ${
           waitingForInput ? 'text-amber-400' : 'text-blue-400'
-        }`}>
+        }`}
+        >
           scanf &gt;&gt;
-        </span>
+        </label>
         <input
+          id="scanf-input"
           ref={inputRef}
           type="text"
           value={inputText}
           onChange={(e) => setInputText(e.target.value)}
           placeholder={
             inputPrompt
-              ? `[Input Required]: ${inputPrompt} (press Enter to submit)`
-              : 'Type input for scanf and press Enter...'
+              ? `${inputPrompt} — press Enter to submit`
+              : 'Type input for scanf and press Enter…'
           }
           className={`flex-1 bg-[#252526] border rounded px-3 py-1.5 text-xs text-gray-200 font-mono focus:outline-none transition ${
             waitingForInput
@@ -165,7 +170,7 @@ export default function ConsoleOutput({
           }`}
         >
           <span>Send Input</span>
-          <Send className="w-3 h-3" />
+          <Send aria-hidden="true" className="w-3 h-3" />
         </button>
       </form>
     </div>

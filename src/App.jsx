@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import Header from './components/Header';
 import Editor from './components/Editor';
 import TokensPanel from './components/TokensPanel';
@@ -19,12 +19,62 @@ export default function App() {
   const [activeTab, setActiveTab] = useState('execution');
   const [isCompiling, setIsCompiling] = useState(false);
   const [compileResult, setCompileResult] = useState(null);
+  // which engine actually produced the current result (may differ from the
+  // requested mode when the native backend is unreachable and we fall back)
+  const [activeEngine, setActiveEngine] = useState(null);
+  const [fallbackNotice, setFallbackNotice] = useState('');
   const [activeLine, setActiveLine] = useState(null);
+  const [errorLine, setErrorLine] = useState(null);
   const [consoleHeight, setConsoleHeight] = useState(200);
   const [terminalInputs, setTerminalInputs] = useState([]);
+  const abortRef = useRef(null);
+
+  const handleCompile = useCallback(async (sourceToCompile = code, inputs = terminalInputs, mode = backendMode) => {
+    // cancel any in-flight native request
+    if (abortRef.current) { try { abortRef.current.abort(); } catch { /* noop */ } }
+
+    setIsCompiling(true);
+    setFallbackNotice('');
+    let result = null;
+    let engineUsed = null;
+
+    if (mode === 'native') {
+      const controller = new AbortController();
+      abortRef.current = controller;
+      try {
+        const response = await fetch('/api/compile', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ source: sourceToCompile, inputs }),
+          signal: controller.signal
+        });
+        if (!response.ok) throw new Error(`Native backend responded ${response.status}`);
+        const data = await response.json();
+        result = data;
+        engineUsed = 'native';
+      } catch (err) {
+        if (err.name === 'AbortError') { setIsCompiling(false); return; }
+        // explicit, visible fallback to the browser engine
+        setFallbackNotice('Native backend unreachable — using the in-browser engine instead.');
+        result = compileCSource(sourceToCompile, inputs);
+        engineUsed = 'browser';
+      }
+    } else {
+      result = compileCSource(sourceToCompile, inputs);
+      engineUsed = 'browser';
+    }
+
+    setCompileResult(result);
+    setActiveEngine(engineUsed);
+    setActiveLine(null);
+    const firstError = (result?.diagnostics || []).find((d) => d.level === 'error');
+    setErrorLine(firstError && firstError.line > 0 ? firstError.line : null);
+    setIsCompiling(false);
+  }, [code, terminalInputs, backendMode]);
 
   useEffect(() => {
-    handleCompile();
+    handleCompile(PRESET_PROGRAMS.hello_world.code, [], 'browser');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const handleSelectPreset = (key) => {
@@ -32,48 +82,19 @@ export default function App() {
     if (PRESET_PROGRAMS[key]) {
       setCode(PRESET_PROGRAMS[key].code);
       setTerminalInputs([]);
-      handleCompile(PRESET_PROGRAMS[key].code, []);
+      handleCompile(PRESET_PROGRAMS[key].code, [], backendMode);
     }
-  };
-
-  const handleCompile = async (sourceToCompile = code, inputs = terminalInputs) => {
-    setIsCompiling(true);
-
-    if (backendMode === 'native') {
-      try {
-        const response = await fetch('http://localhost:8080/api/compile', {
-          method: 'POST',
-          headers: { 'Content-Type': 'text/plain' },
-          body: sourceToCompile
-        });
-        const data = await response.json();
-        setCompileResult(data);
-      } catch (err) {
-        console.warn('Native C server at 8080 unreachable, falling back to browser mirror engine', err);
-        const result = compileCSource(sourceToCompile, inputs);
-        setCompileResult(result);
-      }
-    } else {
-      setTimeout(() => {
-        const result = compileCSource(sourceToCompile, inputs);
-        setCompileResult(result);
-        setIsCompiling(false);
-      }, 100);
-      return;
-    }
-
-    setIsCompiling(false);
   };
 
   const handleTerminalInput = (inputVal) => {
     const updatedInputs = [...terminalInputs, inputVal];
     setTerminalInputs(updatedInputs);
-    handleCompile(code, updatedInputs);
+    handleCompile(code, updatedInputs, backendMode);
   };
 
   const handleFreshCompile = () => {
     setTerminalInputs([]);
-    handleCompile(code, []);
+    handleCompile(code, [], backendMode);
   };
 
   const tabs = [
@@ -81,13 +102,12 @@ export default function App() {
     { id: 'tokens', label: '01. Tokens', icon: Code, badge: compileResult?.tokens?.length },
     { id: 'ast', label: '02. AST Tree', icon: Layers, badge: 'Phase 2' },
     { id: 'symbols', label: '03. Symbol Table', icon: Database, badge: compileResult?.symbolTable?.length },
-    { id: 'tac', label: '04. TAC & Optimization', icon: Zap, badge: `${compileResult?.metrics?.reduction_percentage || 31.4}%` },
+    { id: 'tac', label: '04. TAC & Optimization', icon: Zap, badge: compileResult ? `${compileResult.metrics?.reduction_percentage ?? 0}%` : '' },
     { id: 'bytecode', label: '05. Bytecode', icon: Binary, badge: compileResult?.bytecode?.length }
   ];
 
   return (
     <div className="flex flex-col h-screen bg-[#181818] text-[#cccccc] overflow-hidden">
-      {/* Top Header */}
       <Header
         selectedPreset={selectedPreset}
         onSelectPreset={handleSelectPreset}
@@ -95,30 +115,40 @@ export default function App() {
         isCompiling={isCompiling}
         backendMode={backendMode}
         setBackendMode={setBackendMode}
-        compileTimeMs={compileResult?.compile_time_ms || 3.2}
+        activeEngine={activeEngine}
+        compileTimeMs={compileResult?.compile_time_ms}
       />
+
+      {fallbackNotice && (
+        <div role="status" className="bg-amber-950/60 border-b border-amber-700/50 text-amber-300 text-[11px] px-4 py-1.5">
+          {fallbackNotice}
+        </div>
+      )}
 
       {/* Main Studio Workspace */}
       <div className="flex-1 flex overflow-hidden">
-        {/* Left Side: VS Code Editor */}
+        {/* Left Side: editor */}
         <div className="w-1/2 h-full flex flex-col overflow-hidden">
           <Editor
             code={code}
             onChange={setCode}
             activeLine={activeLine}
+            errorLine={errorLine}
           />
         </div>
 
         {/* Right Side: Visualizers */}
         <div className="w-1/2 h-full flex flex-col bg-[#1e1e1e] border-l border-[#333333] overflow-hidden">
           {/* Tabs Bar */}
-          <div className="flex items-center bg-[#252526] border-b border-[#333333] px-2 overflow-x-auto select-none shrink-0">
+          <div role="tablist" aria-label="Compiler phase visualizers" className="flex items-center bg-[#252526] border-b border-[#333333] px-2 overflow-x-auto select-none shrink-0">
             {tabs.map((tab) => {
               const Icon = tab.icon;
               const isActive = activeTab === tab.id;
               return (
                 <button
                   key={tab.id}
+                  role="tab"
+                  aria-selected={isActive}
                   onClick={() => setActiveTab(tab.id)}
                   className={`flex items-center space-x-2 px-3 py-2.5 text-xs font-medium border-b-2 transition whitespace-nowrap ${
                     isActive
@@ -126,12 +156,13 @@ export default function App() {
                       : 'border-transparent text-gray-400 hover:text-gray-200 hover:bg-[#2d2d2d]'
                   }`}
                 >
-                  <Icon className={`w-3.5 h-3.5 ${isActive ? 'text-blue-400' : 'text-gray-500'}`} />
+                  <Icon aria-hidden="true" className={`w-3.5 h-3.5 ${isActive ? 'text-blue-400' : 'text-gray-500'}`} />
                   <span>{tab.label}</span>
-                  {tab.badge && (
+                  {tab.badge !== undefined && tab.badge !== '' && (
                     <span className={`text-[10px] px-1.5 py-0.2 rounded font-mono ${
                       isActive ? 'bg-blue-500/20 text-blue-400' : 'bg-[#333333] text-gray-400'
-                    }`}>
+                    }`}
+                    >
                       {tab.badge}
                     </span>
                   )}
@@ -141,7 +172,7 @@ export default function App() {
           </div>
 
           {/* Active Visualization Panel Content */}
-          <div className="flex-1 overflow-hidden relative">
+          <div className="flex-1 overflow-hidden relative" role="tabpanel">
             {activeTab === 'execution' && (
               <VMVisualizer
                 vmTrace={compileResult?.vmTrace || []}
@@ -174,8 +205,9 @@ export default function App() {
       {/* Bottom Resizable Interactive Console Panel */}
       <ConsoleOutput
         consoleText={compileResult?.consoleOutput || ''}
-        compileTimeMs={compileResult?.compile_time_ms || 3.2}
-        isSuccess={compileResult?.success !== false}
+        compileTimeMs={compileResult?.compile_time_ms}
+        isSuccess={compileResult ? compileResult.success : true}
+        hasResult={!!compileResult}
         diagnostics={compileResult?.diagnostics || []}
         onInputSubmit={handleTerminalInput}
         height={consoleHeight}
