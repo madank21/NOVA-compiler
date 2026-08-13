@@ -1,16 +1,20 @@
 {
   "name": "nova-studio-compiler",
   "private": true,
-  "version": "1.0.0",
+  "version": "2.0.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "lint": "eslint .",
     "preview": "vite preview",
+    "test": "npm run test:engine && npm run test:parity",
     "test:engine": "node tests/run_engine_test.mjs",
-    "test:c-backend": "cd c_backend && make test_native",
-    "test": "npm run test:engine"
+    "test:parity": "node tests/parity_test.mjs",
+    "test:c-backend": "cd c_backend && make check",
+    "test:all": "npm run test:engine && npm run test:c-backend && npm run test:parity",
+    "backend:build": "cd c_backend && make",
+    "backend:server": "cd c_backend && ./nova_server",
+    "serve": "node scripts/serve.mjs"
   },
   "dependencies": {
     "lucide-react": "^0.460.0",
