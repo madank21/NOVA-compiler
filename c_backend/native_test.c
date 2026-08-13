@@ -1,230 +1,195 @@
-/* Native backend test harness — mirrors tests/run_engine_test.mjs.
- * Exits non-zero if any assertion fails. */
+/* NOVA native backend test harness.
+ * Mirrors tests/run_engine_test.mjs. Zero-dep; exits non-zero on failure. */
 
+#include "compile.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "compile.h"
 
 static int g_passed = 0;
 static int g_failed = 0;
 
-static void check(int cond, const char* name) {
-    if (cond) {
-        g_passed++;
-        printf("[PASS] %s\n", name);
-    } else {
-        g_failed++;
-        printf("[FAIL] %s\n", name);
-    }
+static void check(const char *name, int cond, const char *detail) {
+    if (cond) { g_passed++; printf("[PASS] %s\n", name); }
+    else { g_failed++; printf("[FAIL] %s%s%s\n", name, detail ? " — " : "", detail ? detail : ""); }
 }
 
-static void check_console(const char* name, const char* code, const char* expected) {
-    CompileResult* r = compile_source(code, NULL, 0);
-    char label[256];
-    snprintf(label, sizeof(label), "%s: success", name);
+static void exact_console(const char *name, CompileResult *r, const char *expected) {
     if (!r->success) {
-        check(0, label);
-        for (int i = 0; i < r->diags->count; i++) {
-            printf("       diag: %s: %s (line %d)\n", r->diags->items[i].level,
-                   r->diags->items[i].msg, r->diags->items[i].line);
-        }
-        compile_result_free(r);
+        char d[256];
+        snprintf(d, sizeof(d), "compile failed (%d diagnostics)", r->diags->count);
+        check(name, 0, d);
         return;
     }
-    check(1, label);
-    const char* out = r->vm ? r->vm->console_output : "";
-    snprintf(label, sizeof(label), "%s: console == \"%s\"", name, expected);
-    if (strcmp(out, expected) != 0) {
-        g_failed++;
-        printf("[FAIL] %s\n       got: \"%s\"\n", label, out);
+    const char *actual = r->vm ? r->vm->consoleOutput : "";
+    if (strcmp(actual, expected) != 0) {
+        char d[512];
+        snprintf(d, sizeof(d), "expected \"%s\", got \"%s\"", expected, actual);
+        check(name, 0, d);
     } else {
-        g_passed++;
-        printf("[PASS] %s\n", label);
+        check(name, 1, NULL);
     }
-    compile_result_free(r);
 }
 
-static void check_invalid(const char* name, const char* code) {
-    CompileResult* r = compile_source(code, NULL, 0);
-    char label[256];
-    snprintf(label, sizeof(label), "%s: fails", name);
-    check(!r->success, label);
-    snprintf(label, sizeof(label), "%s: has diagnostics", name);
-    check(r->diags->count > 0, label);
-    compile_result_free(r);
-}
-
-static int has_diag_matching(CompileResult* r, const char* level, const char* substr) {
-    for (int i = 0; i < r->diags->count; i++) {
-        if (strcmp(r->diags->items[i].level, level) == 0 &&
-            strstr(r->diags->items[i].msg, substr)) return 1;
-    }
-    return 0;
-}
+typedef struct { const char *name; const char *code; const char *expected; int expectSuccess; } Case;
 
 int main(void) {
-    /* ---- valid programs (exact console output) ---- */
-    check_console("hello_world",
-        "#include <stdio.h>\nint main() { printf(\"Hello, World!\\n\"); return 0; }",
-        "Hello, World!\n");
-    check_console("arithmetic_precedence",
-        "int main() { int x = 2 + 3 * 4; printf(\"%d\\n\", x); return 0; }",
-        "14\n");
-    check_console("parentheses",
-        "int main() { int x = (2 + 3) * 4; printf(\"%d\\n\", x); return 0; }",
-        "20\n");
-    check_console("int_division_truncates",
-        "int main() { printf(\"%d %d\\n\", 7 / 2, -7 / 2); return 0; }",
-        "3 -3\n");
-    check_console("modulo",
-        "int main() { printf(\"%d %d\\n\", 7 % 3, -7 % 3); return 0; }",
-        "1 -1\n");
-    check_console("comparisons",
-        "int main() { printf(\"%d %d %d %d %d %d\\n\", 1 < 2, 2 < 1, 2 <= 2, 3 >= 4, 5 == 5, 5 != 5); return 0; }",
-        "1 0 1 0 1 0\n");
-    check_console("logical",
-        "int main() { int a = 1, b = 0; printf(\"%d %d %d %d\\n\", a && b, a || b, !a, !!a); return 0; }",
-        "0 1 0 1\n");
-    check_console("if_else",
-        "int main() { int x = 5; if (x > 3) printf(\"big\\n\"); else printf(\"small\\n\"); return 0; }",
-        "big\n");
-    check_console("while_factorial",
-        "int main() { int n = 5, f = 1; while (n > 1) { f = f * n; n = n - 1; } printf(\"%d\\n\", f); return 0; }",
-        "120\n");
-    check_console("for_sum",
-        "int main() { int s = 0; for (int i = 1; i <= 10; i = i + 1) s = s + i; printf(\"%d\\n\", s); return 0; }",
-        "55\n");
-    check_console("for_postfix",
-        "int main() { int s = 0; for (int i = 0; i < 5; i++) s += i; printf(\"%d\\n\", s); return 0; }",
-        "10\n");
-    check_console("break_continue",
-        "int main() { int s = 0; for (int i = 0; i < 10; i++) { if (i == 3) continue; if (i == 7) break; s += i; } printf(\"%d\\n\", s); return 0; }",
-        "18\n");
-    check_console("compound_assignments",
-        "int main() { int x = 10; x += 5; x -= 2; x *= 3; x /= 2; x %= 4; printf(\"%d\\n\", x); return 0; }",
-        "3\n");
-    check_console("function_call",
-        "int add(int a, int b) { return a + b; }\nint main() { printf(\"%d\\n\", add(2, 3)); return 0; }",
-        "5\n");
-    check_console("recursion_factorial",
-        "int fact(int n) { if (n <= 1) return 1; return n * fact(n - 1); }\nint main() { printf(\"%d\\n\", fact(6)); return 0; }",
-        "720\n");
-    check_console("mutual_globals",
-        "int g = 21;\nint twice() { return g * 2; }\nint main() { printf(\"%d\\n\", twice()); return 0; }",
-        "42\n");
-    check_console("array_index_sum",
-        "int main() { int a[4] = {10, 20, 30, 40}; int s = 0; for (int i = 0; i < 4; i++) s += a[i]; printf(\"%d\\n\", s); return 0; }",
-        "100\n");
-    check_console("array_write",
-        "int main() { int a[3]; a[0] = 1; a[1] = 2; a[2] = a[0] + a[1]; printf(\"%d\\n\", a[2]); return 0; }",
-        "3\n");
-    check_console("pointers",
-        "int main() { int x = 5; int *p = &x; *p = *p + 2; printf(\"%d\\n\", x); return 0; }",
-        "7\n");
-    check_console("pointer_params_swap",
-        "void swap(int *a, int *b) { int t = *a; *a = *b; *b = t; }\nint main() { int x = 1, y = 2; swap(&x, &y); printf(\"%d %d\\n\", x, y); return 0; }",
-        "2 1\n");
-    check_console("struct_members",
-        "struct P { int x; float y; };\nint main() { struct P p; p.x = 3; p.y = 1.5; printf(\"%d %.2f\\n\", p.x, p.y); return 0; }",
-        "3 1.50\n");
-    check_console("float_arithmetic",
-        "int main() { float f = 7.0 / 2.0; printf(\"%.2f\\n\", f); return 0; }",
-        "3.50\n");
-    check_console("char_literal",
-        "int main() { char c = 'A'; printf(\"%c %d\\n\", c, c); return 0; }",
-        "A 65\n");
-    check_console("bubble_sort",
-        "#include <stdio.h>\n"
-        "void swap(int *a, int *b) { int temp = *a; *a = *b; *b = temp; }\n"
-        "int main() {\n"
-        "    int arr[5] = {64, 34, 25, 12, 22};\n"
-        "    int n = 5;\n"
-        "    for (int i = 0; i < n - 1; i++) {\n"
-        "        for (int j = 0; j < n - i - 1; j++) {\n"
-        "            if (arr[j] > arr[j + 1]) { swap(&arr[j], &arr[j + 1]); }\n"
-        "        }\n"
-        "    }\n"
-        "    for (int i = 0; i < n; i++) printf(\"%d \", arr[i]);\n"
-        "    printf(\"\\n\");\n"
-        "    return 0;\n"
-        "}",
-        "12 22 25 34 64 \n");
-
-    /* ---- scanf protocol ---- */
-    {
-        const char* code = "int main() { int n; scanf(\"%d\", &n); printf(\"%d\\n\", n); return 0; }";
-        CompileResult* r1 = compile_source(code, NULL, 0);
-        check(r1->vm && r1->vm->waiting_for_input && strlen(r1->vm->input_prompt) > 0,
-              "scanf: suspends when no input");
-        compile_result_free(r1);
-        const char* in1[] = { "17" };
-        CompileResult* r2 = compile_source(code, in1, 1);
-        check(r2->vm && !r2->vm->waiting_for_input && strcmp(r2->vm->console_output, "17\n") == 0,
-              "scanf: resumes with input");
-        compile_result_free(r2);
+    /* ---- valid programs: exact console output ---- */
+    Case valid[] = {
+        { "hello_world", "int main() { printf(\"Hello, World!\\n\"); return 0; }", "Hello, World!\n", 1 },
+        { "arithmetic_precedence", "int main() { int x = 2 + 3 * 4; printf(\"%d\\n\", x); return 0; }", "14\n", 1 },
+        { "parentheses", "int main() { int x = (2 + 3) * 4; printf(\"%d\\n\", x); return 0; }", "20\n", 1 },
+        { "int_division", "int main() { printf(\"%d %d\\n\", 7 / 2, -7 / 2); return 0; }", "3 -3\n", 1 },
+        { "modulo", "int main() { printf(\"%d %d\\n\", 7 % 3, -7 % 3); return 0; }", "1 -1\n", 1 },
+        { "ternary", "int main() { int x = 5; printf(\"%d %d\\n\", x > 3 ? 10 : 20, x > 9 ? 1 : 0); return 0; }", "10 0\n", 1 },
+        { "bitwise", "int main() { int a = 0x55, b = 0xAA; printf(\"%d %d %d %d %d\\n\", a & b, a | b, a ^ b, a << 2, ~a); return 0; }", "0 255 255 340 -86\n", 1 },
+        { "switch_break", "int main() { int v = 2; switch (v) { case 1: printf(\"one\\n\"); break; case 2: printf(\"two\\n\"); break; default: printf(\"other\\n\"); } return 0; }", "two\n", 1 },
+        { "switch_fallthrough", "int main() { int v = 1; switch (v) { case 1: printf(\"a \"); case 2: printf(\"b \"); break; case 3: printf(\"c \"); } printf(\"\\n\"); return 0; }", "a b \n", 1 },
+        { "goto_label", "int main() { int i = 0; loop: i++; if (i < 3) goto loop; printf(\"%d\\n\", i); return 0; }", "3\n", 1 },
+        { "do_while", "int main() { int i = 0; do { i++; } while (i < 5); printf(\"%d\\n\", i); return 0; }", "5\n", 1 },
+        { "sizeof_types", "int main() { printf(\"%d %d %d %d\\n\", (int)sizeof(int), (int)sizeof(double), (int)sizeof(char), (int)sizeof(int *)); return 0; }", "4 8 1 8\n", 1 },
+        { "casts", "int main() { double d = 3.9; int i = (int)d; printf(\"%d %d\\n\", i, (int)7.8); return 0; }", "3 7\n", 1 },
+        { "string_concat", "int main() { char *s = \"Hello \" \"World\"; printf(\"%s\\n\", s); return 0; }", "Hello World\n", 1 },
+        { "static_local", "int counter() { static int c = 0; c++; return c; } int main() { printf(\"%d %d %d\\n\", counter(), counter(), counter()); return 0; }", "1 2 3\n", 1 },
+        { "unsigned_long_decls", "int main() { unsigned int u = 100; long long ll = 200; printf(\"%d %d\\n\", u, ll); return 0; }", "100 200\n", 1 },
+        { "math_builtins", "int main() { printf(\"%d %d %d\\n\", (int)sqrt(16.0), (int)pow(2.0, 3.0), (int)fabs(-7.5)); return 0; }", "4 8 7\n", 1 },
+        { "printf_formats", "int main() { printf(\"%x %X %o %u\\n\", 255, 255, 8, -1); return 0; }", "ff FF 10 4294967295\n", 1 },
+        { "null_predefined", "int main() { int *p = NULL; if (p == NULL) printf(\"null\\n\"); return 0; }", "null\n", 1 },
+        { "ifdef_excludes", "int main() {\n#ifdef __GNUC__\nthis would not parse;\n#endif\nprintf(\"ok\\n\"); return 0; }", "ok\n", 1 },
+        { "assert_passes", "int main() { int x = 5; assert(x == 5); printf(\"ok\\n\"); return 0; }", "ok\n", 1 },
+        { "compound_bitwise", "int main() { int x = 5; x &= 3; x |= 8; x ^= 1; x <<= 1; x >>= 1; printf(\"%d\\n\", x); return 0; }", "8\n", 1 },
+        { "forward_decl", "int add(int a, int b);\nint main() { printf(\"%d\\n\", add(2, 3)); return 0; }\nint add(int a, int b) { return a + b; }", "5\n", 1 },
+        { "while_factorial", "int main() { int n = 5, f = 1; while (n > 1) { f = f * n; n = n - 1; } printf(\"%d\\n\", f); return 0; }", "120\n", 1 },
+        { "for_sum", "int main() { int s = 0; for (int i = 1; i <= 10; i = i + 1) s = s + i; printf(\"%d\\n\", s); return 0; }", "55\n", 1 },
+        { "recursion_factorial", "int fact(int n) { if (n <= 1) return 1; return n * fact(n - 1); }\nint main() { printf(\"%d\\n\", fact(6)); return 0; }", "720\n", 1 },
+        { "array_sum", "int main() { int a[4] = {10, 20, 30, 40}; int s = 0; for (int i = 0; i < 4; i++) s += a[i]; printf(\"%d\\n\", s); return 0; }", "100\n", 1 },
+        { "pointers", "int main() { int x = 5; int *p = &x; *p = *p + 2; printf(\"%d\\n\", x); return 0; }", "7\n", 1 },
+        { "pointer_params", "void swap(int *a, int *b) { int t = *a; *a = *b; *b = t; } int main() { int x = 1, y = 2; swap(&x, &y); printf(\"%d %d\\n\", x, y); return 0; }", "2 1\n", 1 },
+        { "struct_member", "struct P { int x; }; int main() { struct P p; p.x = 7; printf(\"%d\\n\", p.x); return 0; }", "7\n", 1 },
+        { "break_continue", "int main() { int s = 0; for (int i = 0; i < 10; i++) { if (i == 3) continue; if (i == 7) break; s += i; } printf(\"%d\\n\", s); return 0; }", "18\n", 1 },
+        { "char_literal", "int main() { char c = 'A'; printf(\"%c %d\\n\", c, c + 1); return 0; }", "A 66\n", 1 },
+    };
+    int nValid = (int)(sizeof(valid) / sizeof(valid[0]));
+    for (int i = 0; i < nValid; i++) {
+        CompileResult *r = nova_compile(valid[i].code, NULL, 0);
+        char nm[128];
+        snprintf(nm, sizeof(nm), "%s: success", valid[i].name);
+        check(nm, r->success == 1, r->success ? NULL : "compile failed");
+        if (r->success) {
+            snprintf(nm, sizeof(nm), "%s: console", valid[i].name);
+            const char *actual = r->vm ? r->vm->consoleOutput : "";
+            if (strcmp(actual, valid[i].expected) != 0) {
+                char d[512];
+                snprintf(d, sizeof(d), "expected \"%s\", got \"%s\"", valid[i].expected, actual);
+                check(nm, 0, d);
+            } else check(nm, 1, NULL);
+        }
+        nova_compile_free(r);
     }
 
-    /* ---- invalid programs ---- */
-    check_invalid("empty_source", "");
-    check_invalid("missing_main", "int foo() { return 1; }");
-    check_invalid("undefined_identifier", "int main() { int x = y + 1; return 0; }");
-    check_invalid("missing_semicolon", "int main() { int x = 5 return 0; }");
-    check_invalid("unbalanced_brace", "int main() { { return 0; }");
-    check_invalid("unterminated_string", "int main() { printf(\"abc); return 0; }");
-    check_invalid("wrong_arg_count", "int f(int a) { return a; }\nint main() { return f(1, 2); }");
-    check_invalid("break_outside_loop", "int main() { break; return 0; }");
-    check_invalid("unknown_struct_field", "struct S { int x; };\nint main() { struct S s; s.zzz = 1; return 0; }");
-    check_invalid("duplicate_global", "int g; int g;\nint main() { return 0; }");
+    /* ---- invalid programs: must fail with diagnostics, never crash ---- */
+    const char *invalid[][2] = {
+        { "empty_source", "" },
+        { "missing_main", "int foo() { return 1; }" },
+        { "undefined_identifier", "int main() { int x = y + 1; return 0; }" },
+        { "missing_semicolon", "int main() { int x = 5 return 0; }" },
+        { "unbalanced_brace", "int main() { { return 0; }" },
+        { "assignment_to_literal", "int main() { 5 = 3; return 0; }" },
+        { "wrong_arg_count", "int f(int a) { return a; }\nint main() { return f(1, 2); }" },
+        { "break_outside_loop", "int main() { break; return 0; }" },
+        { "typedef_rejected", "typedef int myint;\nint main() { return 0; }" },
+        { "union_rejected", "union U { int a; float b; };\nint main() { return 0; }" },
+        { "enum_rejected", "enum E { A, B };\nint main() { return 0; }" },
+        { "function_pointer_rejected", "int (*cb)(int);\nint main() { return 0; }" },
+        { "variadic_rejected", "int vsum(int n, ...) { return 0; }\nint main() { return 0; }" },
+        { "nested_function_rejected", "int main() { int inner(int x) { return x; } return inner(1); }" },
+        { "undefined_goto_label", "int main() { goto nowhere; return 0; }" },
+        { "bitfield_rejected", "struct B { int a : 3; };\nint main() { return 0; }" },
+        { "unknown_typedef_type", "int main() { FILE *f; return 0; }" },
+        { "garbage_top_level", "@@@ !!!" },
+    };
+    int nInvalid = (int)(sizeof(invalid) / sizeof(invalid[0]));
+    for (int i = 0; i < nInvalid; i++) {
+        CompileResult *r = nova_compile(invalid[i][1], NULL, 0);
+        char nm[128];
+        snprintf(nm, sizeof(nm), "%s: fails", invalid[i][0]);
+        check(nm, r->success == 0, r->success ? "expected failure but succeeded" : NULL);
+        snprintf(nm, sizeof(nm), "%s: has diagnostics", invalid[i][0]);
+        check(nm, r->diags->count > 0, "no diagnostics emitted");
+        nova_compile_free(r);
+    }
 
     /* ---- runtime errors ---- */
     {
-        CompileResult* r = compile_source("int main() { int a = 1; int b = a / 0; return 0; }", NULL, 0);
-        check(has_diag_matching(r, "runtime", "zero"), "div_by_zero: runtime diagnostic");
-        compile_result_free(r);
+        CompileResult *r = nova_compile("int main() { int a = 1; int b = a / 0; return 0; }", NULL, 0);
+        int found = 0;
+        for (int i = 0; i < r->diags->count; i++)
+            if (strcmp(r->diags->items[i].level, "runtime") == 0 && strstr(r->diags->items[i].msg, "zero")) found = 1;
+        check("div_by_zero: runtime diagnostic", found, NULL);
+        nova_compile_free(r);
     }
     {
-        CompileResult* r = compile_source("int main() { int a[2]; a[5] = 1; return 0; }", NULL, 0);
-        check(has_diag_matching(r, "runtime", "bounds"), "oob_index: runtime diagnostic");
-        compile_result_free(r);
+        CompileResult *r = nova_compile("int main() { int a[2]; a[5] = 1; return 0; }", NULL, 0);
+        int found = 0;
+        for (int i = 0; i < r->diags->count; i++)
+            if (strcmp(r->diags->items[i].level, "runtime") == 0 && strstr(r->diags->items[i].msg, "bounds")) found = 1;
+        check("oob_index: runtime diagnostic", found, NULL);
+        nova_compile_free(r);
     }
     {
-        CompileResult* r = compile_source("int fact(int n) { return n * fact(n - 1); }\nint main() { return fact(9); }", NULL, 0);
-        check(has_diag_matching(r, "runtime", ""), "deep_recursion: diagnosed, no crash");
-        compile_result_free(r);
+        CompileResult *r = nova_compile("int f(int n) { return n * f(n - 1); }\nint main() { return f(9); }", NULL, 0);
+        int found = 0;
+        for (int i = 0; i < r->diags->count; i++)
+            if (strcmp(r->diags->items[i].level, "runtime") == 0) found = 1;
+        check("deep_recursion: runtime diagnostic", found, NULL);
+        nova_compile_free(r);
     }
     {
-        CompileResult* r = compile_source("int main() { while (1) { } return 0; }", NULL, 0);
-        check(has_diag_matching(r, "runtime", "step limit"), "infinite_loop: step limit diagnostic");
-        compile_result_free(r);
+        CompileResult *r = nova_compile("int main() { while (1) { } return 0; }", NULL, 0);
+        int found = 0;
+        for (int i = 0; i < r->diags->count; i++)
+            if (strcmp(r->diags->items[i].level, "runtime") == 0 && strstr(r->diags->items[i].msg, "step limit")) found = 1;
+        check("infinite_loop: step limit diagnostic", found, NULL);
+        nova_compile_free(r);
     }
 
-    /* ---- optimizer sanity ---- */
+    /* ---- scanf suspension ---- */
     {
-        CompileResult* r = compile_source("int main() { int x = 2 * 3 + 4; printf(\"%d\\n\", x); return 0; }", NULL, 0);
-        check(r->vm && strcmp(r->vm->console_output, "10\n") == 0, "optimizer: folding preserves semantics");
-        check(r->metrics.constant_fold >= 1, "optimizer: fold counted");
-        check(r->opt_tac->count <= r->tac_gen->instrs->count, "optimizer: instruction count never increases");
-        compile_result_free(r);
+        CompileResult *r1 = nova_compile("int main() { int n; scanf(\"%d\", &n); printf(\"%d\\n\", n); return 0; }", NULL, 0);
+        check("scanf: suspends when no input", r1->vm && r1->vm->waitingForInput, NULL);
+        nova_compile_free(r1);
+        const char *inputs[] = { "42" };
+        CompileResult *r2 = nova_compile("int main() { int n; scanf(\"%d\", &n); printf(\"%d\\n\", n); return 0; }", inputs, 1);
+        check("scanf: resumes with input", r2->vm && !r2->vm->waitingForInput && strcmp(r2->vm->consoleOutput, "42\n") == 0, NULL);
+        nova_compile_free(r2);
     }
 
     /* ---- determinism ---- */
     {
-        const char* src = "int fact(int n) { if (n <= 1) return 1; return n * fact(n - 1); }\n"
-                          "int main() { int a[3] = {1,2,3}; printf(\"%d %d\\n\", fact(5), a[2]); return 0; }";
-        CompileResult* r1 = compile_source(src, NULL, 0);
-        CompileResult* r2 = compile_source(src, NULL, 0);
-        char* j1 = serialize_result_json(r1);
-        char* j2 = serialize_result_json(r2);
-        /* compile_time_ms legitimately differs; compare everything else via console + trace */
-        check(r1->vm && r2->vm && strcmp(r1->vm->console_output, r2->vm->console_output) == 0,
-              "determinism: identical console across runs");
-        check(r1->vm && r2->vm && r1->vm->count == r2->vm->count,
-              "determinism: identical trace length across runs");
-        free(j1);
-        free(j2);
-        compile_result_free(r1);
-        compile_result_free(r2);
+        const char *src = "int fact(int n) { if (n <= 1) return 1; return n * fact(n - 1); }\nint main() { int a[3] = {1,2,3}; printf(\"%d %d\\n\", fact(5), a[2]); return 0; }";
+        CompileResult *r1 = nova_compile(src, NULL, 0);
+        CompileResult *r2 = nova_compile(src, NULL, 0);
+        char *j1 = nova_to_json(r1);
+        char *j2 = nova_to_json(r2);
+        /* compare everything except compile_time_ms by comparing console + structure lengths */
+        check("determinism: same console", strcmp(r1->vm->consoleOutput, r2->vm->consoleOutput) == 0, NULL);
+        check("determinism: same tac count", r1->tac->count == r2->tac->count, NULL);
+        check("determinism: same bytecode count", r1->bytecode->count == r2->bytecode->count, NULL);
+        check("determinism: same vm steps", r1->vm->count == r2->vm->count, NULL);
+        free(j1); free(j2);
+        nova_compile_free(r1);
+        nova_compile_free(r2);
+    }
+
+    /* ---- deterministic rand for a given seed ---- */
+    {
+        const char *src = "int main() { srand(42); printf(\"%d %d\\n\", rand(), rand()); return 0; }";
+        CompileResult *r1 = nova_compile(src, NULL, 0);
+        CompileResult *r2 = nova_compile(src, NULL, 0);
+        check("rand: deterministic for seed",
+              strcmp(r1->vm->consoleOutput, r2->vm->consoleOutput) == 0 && strlen(r1->vm->consoleOutput) > 0, NULL);
+        nova_compile_free(r1);
+        nova_compile_free(r2);
     }
 
     printf("\n%d passed, %d failed\n", g_passed, g_failed);

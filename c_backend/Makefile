@@ -1,5 +1,9 @@
 CC ?= gcc
-CFLAGS ?= -std=c99 -Wall -Wextra -O2
+# -Wstringop-truncation is disabled deliberately: the codebase copies into
+# fixed-size struct fields with bounded strncpy (identifiers are capped at 255
+# by the lexer). Real overflows are still caught by -Wstringop-overflow and
+# the `asan` target (AddressSanitizer + UBSan).
+CFLAGS ?= -std=c99 -Wall -Wextra -O2 -Wno-stringop-truncation
 CPPFLAGS += -D_POSIX_C_SOURCE=200809L -I.
 
 # Windows (MinGW) needs ws2_32 for sockets; Linux/macOS do not.
@@ -15,7 +19,7 @@ else
   endif
 endif
 
-COMMON_SRCS := lexer.c parser.c semantic.c tac.c optimizer.c bytecode.c vm.c json.c compile.c diag.c fmt.c
+COMMON_SRCS := lexer.c parser.c semantic.c tac.c optimizer.c bytecode.c vm.c json.c compile.c diag.c
 COMMON_OBJS := $(COMMON_SRCS:.c=.o)
 
 all: nova_compiler nova_server
