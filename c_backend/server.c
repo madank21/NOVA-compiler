@@ -392,17 +392,17 @@ static void handle_connection(socket_t client) {
         RequestPayload pl;
         int is_json = parse_request_payload(body, body_len, &pl);
         const char* source = is_json && pl.source ? pl.source : body;
-        CompileResult* result = compile_source(
+        CompileResult* result = nova_compile(
             source,
             (const char**)(pl.input_count ? pl.inputs : NULL),
             pl.input_count);
-        char* json = serialize_result_json(result);
+        char* json = nova_to_json(result);
         send_response(client, 200, "OK", "application/json", json, strlen(json));
         clock_gettime(CLOCK_MONOTONIC, &t1);
         double ms = (double)(t1.tv_sec - t0.tv_sec) * 1000.0 + (double)(t1.tv_nsec - t0.tv_nsec) / 1e6;
         log_request(method, path, 200, strlen(json), ms);
         free(json);
-        compile_result_free(result);
+        nova_compile_free(result);
         payload_free(&pl);
     } else if (strcmp(path, "/api/compile") == 0) {
         const char* msg = "{\"error\":\"method not allowed\"}";

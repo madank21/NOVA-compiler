@@ -1,0 +1,178 @@
+# NOVA Compiler JSON Contract (v2)
+
+Both engines — the browser implementation (`src/engine/compilerEngine.js`) and the
+native C backend (`c_backend/`) — emit **byte-identical JSON** for the same source
+and inputs. This is enforced by `tests/parity_test.mjs` (field-by-field deep
+comparison; only `compile_time_ms` and `engine` are exempt).
+
+## Request
+
+`POST /api/compile` (native backend or the Vite/Docker proxy):
+
+```json
+{ "source": "int main() { return 0; }", "inputs": ["42"] }
+```
+
+- `source` (string, required): the C-subset program.
+- `inputs` (array of strings, optional): stdin values consumed by `scanf` in order.
+
+A raw `text/plain` body is also accepted and treated as `source`. The CLI mirrors
+this: `nova_compiler file.c` with `NOVA_INPUTS` (newline-separated) for scanf input.
+
+## Response
+
+| Field | Type | Description |
+|---|---|---|
+| `success` | boolean | true when no `error`-level diagnostics exist (compile **and** runtime) |
+| `engine` | string | `"browser-js"` or `"native-c"` |
+| `compile_time_ms` | number | pipeline wall time (excluded from parity comparisons) |
+| `tokens` | `Token[]` | full token stream including `TOKEN_EOF` |
+| `ast` | `AstNode` | children-only abstract syntax tree |
+| `symbolTable` | `Symbol[]` | insertion-order table: builtins, structs, globals, functions, then per-function scopes |
+| `tac` | `TacInstr[]` | raw three-address code |
+| `optTac` | `TacInstr[]` | optimized TAC |
+| `metrics` | `Metrics` | **real** optimizer counters |
+| `bytecode` | `Instr[]` | stack-VM bytecode with resolved jump targets |
+| `vmTrace` | `Step[]` | one step per executed instruction (capped at 2000, see `vmTraceTruncated`) |
+| `vmTraceTruncated` | boolean | trace was capped |
+| `waitingForInput` | boolean | execution suspended at `scanf` awaiting more `inputs` |
+| `inputPrompt` | string | human-readable prompt while suspended |
+| `consoleOutput` | string | final program stdout |
+| `exitCode` | number | `main`'s return value |
+| `diagnostics` | `Diag[]` | compile + runtime diagnostics |
+
+### Token
+
+```json
+{ "type": "TOKEN_INT", "lexeme": "int", "line": 1, "column": 1 }
+```
+
+`type` is one of the C-backend token names (`TOKEN_INT`, `TOKEN_PLUS`,
+`TOKEN_INTEGER_LITERAL`, `TOKEN_STRING_LITERAL`, `TOKEN_INCLUDE`, `TOKEN_EOF`, …).
+The same enum is used by both engines.
+
+### AstNode
+
+```json
+{ "type": "NODE_BINARY_OP", "op": "+", "line": 3, "children": [ … ] }
+```
+
+Optional fields (present only when meaningful): `identifier`, `type_name`, `op`,
+`num_val`, `string_val`, `is_array` (true), `has_size` (true when an explicit array
+size literal is present — `children[0]` is then that size literal).
+
+Node types: `NODE_PROGRAM`, `NODE_FUNCTION_DEF`, `NODE_PARAMETER`,
+`NODE_STRUCT_DEF`, `NODE_STRUCT_FIELD`, `NODE_VAR_DECL`, `NODE_DECL_LIST`,
+`NODE_IF_STMT`, `NODE_WHILE_STMT`, `NODE_FOR_STMT`, `NODE_RETURN_STMT`,
+`NODE_BREAK_STMT`, `NODE_CONTINUE_STMT`, `NODE_COMPOUND_STMT`,
+`NODE_EXPRESSION_STMT`, `NODE_BINARY_OP`, `NODE_UNARY_OP` (`op` `-` `!` `*` `&`
+`++` `--` `p++` `p--`), `NODE_ASSIGNMENT`, `NODE_COMPOUND_ASSIGN`,
+`NODE_FUNC_CALL`, `NODE_INDEX`, `NODE_MEMBER`, `NODE_INT_LITERAL`,
+`NODE_FLOAT_LITERAL`, `NODE_STRING_LITERAL`, `NODE_IDENTIFIER`, `NODE_EMPTY`,
+`NODE_ERROR`.
+
+### Symbol
+
+```json
+{ "scope": "main", "name": "x", "kind": "Variable", "type": "int",
+  "address": "0x0014", "params": 0 }
+```
+
+- `kind`: `Function` | `Variable` | `Parameter` | `Array` | `Struct`
+- `address`: `0x` + slot*4 (uppercase hex); frame slots are relative to the frame base
+- `params`: arity, or `-1` for variadic builtins (`printf`, `scanf`)
+- Redeclared names (e.g. `i` in two sibling `for` loops) appear once per declaration
+  in the table; the VM/bytecode resolve to the **latest** declaration.
+
+### TacInstr
+
+```json
+{ "op": "+", "res": "t3", "a1": "t1", "a2": "t2", "line": 4 }
+```
+
+`res` = write target, `a1`/`a2` = read operands. Opcodes:
+
+| Category | Opcodes |
+|---|---|
+| arithmetic/logic | `+` `-` `*` `/` `%` `==` `!=` `<` `>` `<=` `>=` `&&` `||` `neg` `!` |
+| assignment | `=` (res = a1) |
+| memory | `ADDR` (res = &a1 + a2), `IDX_ADDR` (res = &a1[a2]), `LOAD_PTR` (res = *a1), `STORE_PTR` (*a1 = a2) |
+| control | `LABEL`, `GOTO`, `IF_FALSE` |
+| calls | `PARAM`, `CALL` (res = call a1, a2 args), `RETURN` (a1 = value) |
+| io | `PRINT` (a1 = format string ref, a2 = arg count), `READ` (scanf) |
+| structure | `FUNC_BEGIN`, `FUNC_END` |
+
+Temporaries are `t0…`, labels `L0…` — counters are shared across the whole program,
+so numbering is identical in both engines.
+
+### Metrics
+
+```json
+{ "constant_fold": 1, "constant_prop": 1, "dead_code": 1,
+  "strength_reduce": 0, "reduction_percentage": 12.5 }
+```
+
+All counters are real rewrite counts. `reduction_percentage =
+round((1 - optTac.length / tac.length) * 1000) / 10` — never fabricated.
+
+### Bytecode Instr
+
+```json
+{ "pc": 3, "op": "STORE", "operand": 0, "symbol": "x", "line": 2 }
+```
+
+Opcodes: `PUSH`, `PUSH_STR`, `POP`, `LOAD`, `STORE`, `ADDR`, `IDX_ADDR`,
+`LOAD_AT`, `STORE_AT`, `ADD` `SUB` `MUL` `DIV` (truncating int) `DIVF` (float)
+`MOD`, `NEG`, `NOT`, `EQ` `NEQ` `LT` `GT` `LEQ` `GEQ`, `AND` `OR`, `JMP`, `JZ`,
+`CALL`, `RET`, `PRINT`, `INPUT`, `HALT`.
+
+`JMP`/`JZ` operands are resolved instruction indices. `IDX_ADDR` performs bounds
+checking for fixed-size arrays at runtime.
+
+### VM Step
+
+```json
+{ "step": 5, "pc": 5, "line": 3, "instruction": "STORE x",
+  "stack": [14], "variables": [{ "name": "x", "value": 14 }],
+  "frames": [{ "func": "main()", "retAddr": "0x0000" }],
+  "console": "" }
+```
+
+- `instruction` is the decoded opcode + operand (never a fake `EXEC_LINE`).
+- `stack` is the operand stack before the instruction executes (string-pool cells
+  serialize as `0`).
+- `variables` = globals + current frame locals (Map semantics: one entry per name,
+  latest declaration wins).
+- `frames` = full call stack, deepest first.
+
+### Diag
+
+```json
+{ "level": "error", "msg": "Undefined identifier 'y'", "line": 1, "column": 1 }
+```
+
+`level`: `error` (compile), `warning`, or `runtime` (division by zero, out-of-bounds
+index, invalid memory access, call-stack overflow, step-limit exceeded). Runtime
+diagnostics halt execution and set `success` to `false` at the pipeline level only
+when they occur before VM execution completes normally; the JSON keeps both.
+
+## Execution limits (both engines)
+
+| Limit | Value |
+|---|---|
+| VM step cap | 200 000 |
+| Recorded trace steps | 2 000 |
+| Operand stack | 4 096 cells |
+| Call depth | 1 024 frames |
+| Memory | 65 536 double-word slots |
+
+## Language subset (v1)
+
+`int`, `char`, `float`, `double` scalars; fixed arrays with initializer lists;
+struct definitions and member access; pointers (`&`, `*`, pointer parameters);
+`if/else`, `while`, `for`, `break`, `continue`, `return`; functions with recursion;
+`printf`/`scanf` with format strings (`%d %i %f %.Nf %c %s %%`); global variables
+with constant initializers. Preprocessor directives are skipped (`#include`,
+`#define`). Not supported (diagnostics will say so): ternary `?:`, `switch`,
+`do/while`, pointer arithmetic beyond indexing, dynamic memory, multi-declarator
+initializers with mixed array/scalar forms.

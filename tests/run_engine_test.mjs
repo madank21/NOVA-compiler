@@ -204,6 +204,118 @@ const validCases = [
       '}'
     ].join('\n'),
     console: '12 22 25 34 64 \n'
+  },
+  // --- extended subset (v2) ---
+  {
+    name: 'ternary_operator',
+    code: 'int main() { int x = 5; printf("%d %d\\n", x > 3 ? 10 : 20, x > 9 ? 1 : 0); return 0; }',
+    console: '10 0\n'
+  },
+  {
+    name: 'bitwise_ops',
+    code: 'int main() { int a = 0x55, b = 0xAA; printf("%d %d %d %d %d\\n", a & b, a | b, a ^ b, a << 2, ~a); return 0; }',
+    console: '0 255 255 340 -86\n'
+  },
+  {
+    name: 'switch_break',
+    code: 'int main() { int v = 2; switch (v) { case 1: printf("one\\n"); break; case 2: printf("two\\n"); break; default: printf("other\\n"); } return 0; }',
+    console: 'two\n'
+  },
+  {
+    name: 'switch_fallthrough',
+    code: 'int main() { int v = 1; switch (v) { case 1: printf("a "); case 2: printf("b "); break; case 3: printf("c "); } printf("\\n"); return 0; }',
+    console: 'a b \n'
+  },
+  {
+    name: 'goto_label',
+    code: 'int main() { int i = 0; loop: i++; if (i < 3) goto loop; printf("%d\\n", i); return 0; }',
+    console: '3\n'
+  },
+  {
+    name: 'do_while',
+    code: 'int main() { int i = 0; do { i++; } while (i < 5); printf("%d\\n", i); return 0; }',
+    console: '5\n'
+  },
+  {
+    name: 'sizeof_types',
+    code: 'int main() { printf("%d %d %d %d\\n", (int)sizeof(int), (int)sizeof(double), (int)sizeof(char), (int)sizeof(int *)); return 0; }',
+    console: '4 8 1 8\n'
+  },
+  {
+    name: 'explicit_casts',
+    code: 'int main() { double d = 3.9; int i = (int)d; printf("%d %d\\n", i, (int)7.8); return 0; }',
+    console: '3 7\n'
+  },
+  {
+    name: 'string_concat',
+    code: 'int main() { char *s = "Hello " "World"; printf("%s\\n", s); return 0; }',
+    console: 'Hello World\n'
+  },
+  {
+    name: 'static_local_persists',
+    code: 'int counter() { static int c = 0; c++; return c; } int main() { printf("%d %d %d\\n", counter(), counter(), counter()); return 0; }',
+    console: '1 2 3\n'
+  },
+  {
+    name: 'unsigned_long_decls',
+    code: 'int main() { unsigned int u = 100; long long ll = 200; printf("%d %d\\n", u, ll); return 0; }',
+    console: '100 200\n'
+  },
+  {
+    name: 'math_builtins',
+    code: 'int main() { printf("%d %d %d\\n", (int)sqrt(16.0), (int)pow(2.0, 3.0), (int)fabs(-7.5)); return 0; }',
+    console: '4 8 7\n'
+  },
+  {
+    name: 'printf_hex_oct_unsigned',
+    code: 'int main() { printf("%x %X %o %u\\n", 255, 255, 8, -1); return 0; }',
+    console: 'ff FF 10 4294967295\n'
+  },
+  {
+    name: 'null_predefined',
+    code: 'int main() { int *p = NULL; if (p == NULL) printf("null\\n"); return 0; }',
+    console: 'null\n'
+  },
+  {
+    name: 'ifdef_excludes_inactive',
+    code: 'int main() {\n#ifdef __GNUC__\nthis would not parse;\n#endif\nprintf("ok\\n"); return 0; }',
+    console: 'ok\n'
+  },
+  {
+    name: 'assert_passes',
+    code: 'int main() { int x = 5; assert(x == 5); printf("ok\\n"); return 0; }',
+    console: 'ok\n'
+  },
+  {
+    name: 'line_spliced_directive',
+    code: '#define FOO \\\n  bar\nint main() { printf("ok\\n"); return 0; }',
+    console: 'ok\n'
+  },
+  {
+    name: 'compound_bitwise_assign',
+    code: 'int main() { int x = 5; x &= 3; x |= 8; x ^= 1; x <<= 1; x >>= 1; printf("%d\\n", x); return 0; }',
+    console: '8\n'
+  },
+  {
+    name: 'forward_declaration',
+    code: 'int add(int a, int b);\nint main() { printf("%d\\n", add(2, 3)); return 0; }\nint add(int a, int b) { return a + b; }',
+    console: '5\n'
+  },
+  {
+    name: 'char_literal_and_format',
+    code: "int main() { char c = 'A'; printf(\"%c %d\\n\", c, c + 1); return 0; }",
+    console: 'A 66\n'
+  },
+  {
+    name: 'struct_member_via_arrow_rejected_gracefully',
+    code: 'struct P { int x; }; int main() { struct P p; p.x = 7; printf("%d\\n", p.x); return 0; }',
+    console: '7\n'
+  },
+  {
+    name: 'deterministic_rand',
+    code: 'int main() { srand(42); printf("%d %d\\n", rand(), rand()); return 0; }',
+    console: null, // asserted separately for determinism
+    skipConsole: true
   }
 ];
 
@@ -212,7 +324,9 @@ for (const t of validCases) {
   check(`${t.name}: success`, r.success === true,
     `diagnostics=${JSON.stringify(r.diagnostics)}`);
   if (r.success) {
-    exact(`${t.name}: console output`, r.consoleOutput, t.console);
+    if (!t.skipConsole) {
+      exact(`${t.name}: console output`, r.consoleOutput, t.console);
+    }
     check(`${t.name}: no diagnostics`, r.diagnostics.length === 0,
       JSON.stringify(r.diagnostics));
     check(`${t.name}: tokens non-empty`, Array.isArray(r.tokens) && r.tokens.length > 0);
@@ -221,6 +335,15 @@ for (const t of validCases) {
     check(`${t.name}: vm trace non-empty`, Array.isArray(r.vmTrace) && r.vmTrace.length > 0);
     check(`${t.name}: engine tag`, r.engine === 'browser-js');
   }
+}
+
+// rand() must be deterministic for a given seed (identical across runs)
+{
+  const src = 'int main() { srand(42); printf("%d %d\\n", rand(), rand()); return 0; }';
+  const r1 = compileCSource(src, []);
+  const r2 = compileCSource(src, []);
+  check('rand: deterministic for seed', r1.consoleOutput === r2.consoleOutput && r1.consoleOutput.length > 0,
+    `${JSON.stringify(r1.consoleOutput)} vs ${JSON.stringify(r2.consoleOutput)}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -242,7 +365,17 @@ const invalidCases = [
   { name: 'duplicate_global', code: 'int g; int g;\nint main() { return 0; }' },
   { name: 'struct_field_not_type', code: 'struct S { zzz q; };\nint main() { return 0; }' },
   { name: 'garbage_top_level', code: '@@@ !!!' },
-  { name: 'huge_nesting', code: 'int main() { int x = ((((((((((1)))))))))); return 0; }' } // valid actually
+  { name: 'huge_nesting', code: 'int main() { int x = ((((((((((1)))))))))); return 0; }' }, // valid actually
+  // v2 graceful rejections — one clear diagnostic, no cascades
+  { name: 'typedef_rejected', code: 'typedef int myint;\nint main() { return 0; }' },
+  { name: 'union_rejected', code: 'union U { int a; float b; };\nint main() { return 0; }' },
+  { name: 'enum_rejected', code: 'enum E { A, B };\nint main() { return 0; }' },
+  { name: 'function_pointer_rejected', code: 'int (*cb)(int);\nint main() { return 0; }' },
+  { name: 'variadic_rejected', code: 'int vsum(int n, ...) { return 0; }\nint main() { return 0; }' },
+  { name: 'nested_function_rejected', code: 'int main() { int inner(int x) { return x; } return inner(1); }' },
+  { name: 'undefined_goto_label', code: 'int main() { goto nowhere; return 0; }' },
+  { name: 'bitfield_rejected', code: 'struct B { int a : 3; };\nint main() { return 0; }' },
+  { name: 'unknown_typedef_type', code: 'int main() { FILE *f; return 0; }' }
 ];
 
 for (const t of invalidCases) {

@@ -1,540 +1,582 @@
-#include "vm.h"
-#include "fmt.h"
+#include "compile.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <math.h>
 
-static void* xmalloc(size_t n) { void* p = malloc(n); if (!p) { fprintf(stderr, "nova: out of memory\n"); exit(1); } return p; }
-static void* xrealloc(void* p, size_t n) { void* q = realloc(p, n); if (!q) { fprintf(stderr, "nova: out of memory\n"); exit(1); } return q; }
-static void* xcalloc(size_t n, size_t s) { void* p = calloc(n, s); if (!p) { fprintf(stderr, "nova: out of memory\n"); exit(1); } return p; }
-static char* xstrdup(const char* s) { char* p = strdup(s); if (!p) { fprintf(stderr, "nova: out of memory\n"); exit(1); } return p; }
+#define VM_MEM_MAX 65536
+#define VM_STACK_MAX 4096
+#define VM_CALL_DEPTH_MAX 1024
+#define VM_MAX_STEPS 200000
+#define VM_TRACE_MAX_STEPS 2000
 
-/* ------------------------------------------------------------------------- */
-/* Growable console buffer                                                    */
-/* ------------------------------------------------------------------------- */
+static void *xmalloc(size_t n) { void *p = malloc(n); if (!p) { fprintf(stderr, "nova: out of memory\n"); exit(1); } return p; }
+static void *xcalloc(size_t n, size_t s) { void *p = calloc(n, s); if (!p) { fprintf(stderr, "nova: out of memory\n"); exit(1); } return p; }
+static void *xrealloc(void *p, size_t n) { void *q = realloc(p, n); if (!q) { fprintf(stderr, "nova: out of memory\n"); exit(1); } return q; }
+static char *xstrdup(const char *s) { char *d = strdup(s); if (!d) { fprintf(stderr, "nova: out of memory\n"); exit(1); } return d; }
 
-typedef struct { char* data; int len; int capacity; } Console;
-
-static void console_init(Console* c) {
-    c->capacity = 256;
-    c->len = 0;
-    c->data = (char*)xmalloc((size_t)c->capacity);
-    c->data[0] = '\0';
+static long long truncate_ll(double v) {
+    const double LIM = 9007199254740991.0;
+    if (v >= LIM) return 9007199254740991LL;
+    if (v <= -LIM) return -9007199254740991LL;
+    return (long long)v;
 }
-
-static void console_append(Console* c, const char* s) {
-    int n = (int)strlen(s);
-    while (c->len + n + 1 >= c->capacity) {
-        c->capacity *= 2;
-        c->data = (char*)xrealloc(c->data, (size_t)c->capacity);
-    }
-    memcpy(c->data + c->len, s, (size_t)n);
-    c->len += n;
-    c->data[c->len] = '\0';
+static void fmt_number(double v, char *out, size_t n) {
+    nova_fmt_shortest(v, out, n);
 }
-
-/* ------------------------------------------------------------------------- */
-/* Stack cells (number or string-pool reference)                              */
-/* ------------------------------------------------------------------------- */
 
 typedef struct { double n; int s; int is_str; } Cell;
-
-typedef struct { char func[256]; int ret_pc; int bp; } Frame;
+typedef struct { char func[256]; int retPC; int bp; } Frame;
 
 typedef struct {
-    const BytecodeChunk* chunk;
-    SemModel* sem;
-    DiagList* diags;
-    double* mem;
-    int mem_top;
-    Cell* stack;
-    int sp;
-    Frame* frames;
-    int frame_count;
-    Console console;
-    VMResult* result;
+    double *mem;
+    Cell *stack; int sp;
+    Frame *frames; int frame_count;
+    char *console; int console_len, console_cap;
+    int *strBase; int strBase_count;
+    int randState;
     int halted;
-    int input_idx;
-    const char** inputs;
-    int input_count;
-    /* snapshot metadata */
-    SymRec* global_list;   /* == sem->globals.items */
-    int global_count;
+    int waitingForInput;
+    char inputPrompt[256];
+    int inputIdx;
+    const char **inputs; int input_count;
+    int exitCode;
+    DiagList *runtimeDiags;
+    VMResult *result;
+    BcResult *bc;
+    SemResult *sem;
 } VM;
 
-static void vm_runtime_error(VM* vm, const char* msg, int line) {
-    diag_add(vm->diags, "runtime", line, 0, "%s", msg);
+static void vm_runtime_error(VM *vm, const char *msg, int line) {
+    diag_add(vm->runtimeDiags, "runtime", line, 0, "%s", msg);
     vm->halted = 1;
 }
 
-static void vm_push(VM* vm, double v) {
+static void vm_push(VM *vm, double v) {
     if (vm->sp >= VM_STACK_MAX) { vm_runtime_error(vm, "Operand stack overflow", 0); return; }
     vm->stack[vm->sp].n = v;
     vm->stack[vm->sp].is_str = 0;
     vm->sp++;
 }
-
-static void vm_push_str(VM* vm, int idx) {
-    if (vm->sp >= VM_STACK_MAX) { vm_runtime_error(vm, "Operand stack overflow", 0); return; }
-    vm->stack[vm->sp].s = idx;
-    vm->stack[vm->sp].n = 0;
-    vm->stack[vm->sp].is_str = 1;
-    vm->sp++;
-}
-
-static Cell vm_pop(VM* vm) {
+static Cell vm_pop(VM *vm) {
     if (vm->sp > 0) { vm->sp--; return vm->stack[vm->sp]; }
     vm_runtime_error(vm, "Operand stack underflow", 0);
     Cell c; c.n = 0; c.s = 0; c.is_str = 0;
     return c;
 }
 
-static int frame_size_of(VM* vm, const char* func) {
-    FuncDef* f = sem_get_function(vm->sem, func);
-    int base = f ? f->frame_size : 0;
-    return base + chunk_temps_for(vm->chunk, func);
+static void console_append(VM *vm, const char *s) {
+    int len = (int)strlen(s);
+    while (vm->console_len + len + 1 >= vm->console_cap) {
+        vm->console_cap = vm->console_cap ? vm->console_cap * 2 : 256;
+        vm->console = (char *)xrealloc(vm->console, (size_t)vm->console_cap);
+    }
+    memcpy(vm->console + vm->console_len, s, (size_t)len);
+    vm->console_len += len;
+    vm->console[vm->console_len] = '\0';
 }
 
-static void describe_instr(const BInstr* i, char* out, size_t out_size) {
-    char num[64];
-    if (strcmp(i->op, "PUSH") == 0) {
-        format_value(i->operand, num, sizeof(num));
-        snprintf(out, out_size, "PUSH %s", num);
-    } else if (strcmp(i->op, "LOAD") == 0) {
-        snprintf(out, out_size, "LOAD %s", i->symbol);
-    } else if (strcmp(i->op, "STORE") == 0) {
-        snprintf(out, out_size, "STORE %s", i->symbol);
-    } else if (strcmp(i->op, "ADDR") == 0) {
-        format_value(i->operand, num, sizeof(num));
-        snprintf(out, out_size, "ADDR %s+%s", i->symbol, num);
-    } else if (strcmp(i->op, "JMP") == 0) {
-        snprintf(out, out_size, "JMP %s", i->symbol);
-    } else if (strcmp(i->op, "JZ") == 0) {
-        snprintf(out, out_size, "JZ %s", i->symbol);
-    } else if (strcmp(i->op, "CALL") == 0) {
-        snprintf(out, out_size, "CALL %s (%lld args)", i->symbol, nova_truncate_i64(i->operand));
-    } else if (strcmp(i->op, "RET") == 0) {
-        snprintf(out, out_size, "RET");
-    } else if (strcmp(i->op, "PRINT") == 0) {
-        snprintf(out, out_size, "PRINT");
-    } else if (strcmp(i->op, "INPUT") == 0) {
-        snprintf(out, out_size, "INPUT");
-    } else if (strcmp(i->op, "HALT") == 0) {
-        snprintf(out, out_size, "HALT");
-    } else {
-        snprintf(out, out_size, "%s", i->op);
-    }
+/* ----------------------------- printf format ----------------------------- */
+
+static unsigned long long to_unsigned32(double v) {
+    long long t = truncate_ll(v);
+    t %= 4294967296LL;
+    if (t < 0) t += 4294967296LL;
+    return (unsigned long long)t;
 }
 
-static void record_step(VM* vm, int pc, const BInstr* instr) {
-    VMResult* r = vm->result;
-    if (r->count >= VM_TRACE_MAX_STEPS) { r->truncated = 1; return; }
-    if (r->count >= r->capacity) {
-        r->capacity = r->capacity ? r->capacity * 2 : 256;
-        r->steps = (VMStep*)xrealloc(r->steps, sizeof(VMStep) * (size_t)r->capacity);
-    }
-    VMStep* step = &r->steps[r->count++];
-    memset(step, 0, sizeof(VMStep));
-    step->step = r->count - 1;
-    step->pc = pc;
-    step->line = instr->line;
-    char ibuf[192];
-    describe_instr(instr, ibuf, sizeof(ibuf));
-    step->instruction = xstrdup(ibuf);
-
-    step->stack_count = vm->sp;
-    step->stack = (double*)xmalloc(sizeof(double) * (size_t)(vm->sp > 0 ? vm->sp : 1));
-    for (int i = 0; i < vm->sp; i++) {
-        step->stack[i] = vm->stack[i].is_str ? 0.0 : vm->stack[i].n;
-    }
-
-    int var_count = vm->global_count;
-    Frame* frame = vm->frame_count > 0 ? &vm->frames[vm->frame_count - 1] : NULL;
-    FuncDef* fdef = frame ? sem_get_function(vm->sem, frame->func) : NULL;
-
-    /* Mirror the JS engine's Map<name,rec>: each local name appears once,
-     * at its first-insertion position, carrying its latest rec. Build a
-     * deduplicated index list of frame entries. */
-    int* local_idx = NULL;
-    int local_count = 0;
-    if (fdef) {
-        local_idx = (int*)xmalloc(sizeof(int) * (size_t)(fdef->frame.count > 0 ? fdef->frame.count : 1));
-        for (int i = 0; i < fdef->frame.count; i++) {
-            SymRec* rec = &fdef->frame.items[i];
-            if (rec->is_param) continue;
-            int already = 0;
-            for (int k = 0; k < local_count; k++) {
-                if (strcmp(fdef->frame.items[local_idx[k]].name, rec->name) == 0) { already = 1; break; }
-            }
-            if (!already) local_idx[local_count++] = i;
-        }
-        /* point each kept slot at the LATEST rec with that name */
-        for (int k = 0; k < local_count; k++) {
-            const char* nm = fdef->frame.items[local_idx[k]].name;
-            for (int j = local_idx[k] + 1; j < fdef->frame.count; j++) {
-                if (strcmp(fdef->frame.items[j].name, nm) == 0) local_idx[k] = j;
-            }
-        }
-    }
-
-    step->var_count = var_count + local_count;
-    step->variables = (VMVarSnap*)xmalloc(sizeof(VMVarSnap) * (size_t)(step->var_count > 0 ? step->var_count : 1));
-    int vi = 0;
-    for (int i = 0; i < vm->global_count; i++) {
-        snprintf(step->variables[vi].name, sizeof(step->variables[0].name), "%s", vm->global_list[i].name);
-        step->variables[vi].value = vm->mem[vm->global_list[i].offset];
-        vi++;
-    }
-    if (fdef) {
-        for (int k = 0; k < local_count; k++) {
-            SymRec* rec = &fdef->frame.items[local_idx[k]];
-            snprintf(step->variables[vi].name, sizeof(step->variables[0].name), "%s", rec->name);
-            step->variables[vi].value = vm->mem[frame->bp + rec->offset];
-            vi++;
-        }
-    }
-    free(local_idx);
-
-    step->frame_count = vm->frame_count;
-    step->frames = (VMFrameSnap*)xmalloc(sizeof(VMFrameSnap) * (size_t)(vm->frame_count > 0 ? vm->frame_count : 1));
-    for (int i = 0; i < vm->frame_count; i++) {
-        snprintf(step->frames[i].func, sizeof(step->frames[0].func), "%s()", vm->frames[i].func);
-        int rpc = vm->frames[i].ret_pc > 0 ? vm->frames[i].ret_pc : 0;
-        snprintf(step->frames[i].ret_addr, sizeof(step->frames[0].ret_addr), "0x%04X", (unsigned)rpc);
-    }
-
-    step->console = xstrdup(vm->console.data);
-}
-
-/* printf formatting (mirrors the JS formatPrintf exactly) */
-static void format_printf(VM* vm, const char* fmt, Cell* args, int nargs, Console* out) {
-    char buf[128];
+static void format_printf(VM *vm, const char *fmt, Cell *args, int nargs) {
+    char out[1024];
+    char numbuf[64];
     int ai = 0;
-    size_t len = strlen(fmt);
-    for (size_t i = 0; i < len; i++) {
+    size_t flen = strlen(fmt);
+    for (size_t i = 0; i < flen; i++) {
         char ch = fmt[i];
         if (ch != '%') {
             char one[2] = { ch, '\0' };
-            console_append(out, one);
+            console_append(vm, one);
             continue;
         }
         i++;
-        if (i < len && fmt[i] == '%') { console_append(out, "%"); continue; }
+        if (i < flen && fmt[i] == '%') { console_append(vm, "%"); continue; }
+        while (i < flen && strchr("-+ #0", fmt[i])) i++;
+        while (i < flen && isdigit((unsigned char)fmt[i])) i++;
         int prec = -1;
-        if (i < len && fmt[i] == '.') {
+        if (i < flen && fmt[i] == '.') {
             i++;
-            char digits[16];
-            int dn = 0;
-            while (i < len && fmt[i] >= '0' && fmt[i] <= '9' && dn < 15) {
-                digits[dn++] = fmt[i++];
-            }
-            digits[dn] = '\0';
-            prec = dn == 0 ? 0 : atoi(digits);
+            int digits = 0; int hasd = 0;
+            while (i < flen && isdigit((unsigned char)fmt[i])) { digits = digits * 10 + (fmt[i] - '0'); hasd = 1; i++; }
+            prec = hasd ? digits : 0;
         }
-        while (i < len && (fmt[i] == 'l' || fmt[i] == 'h')) i++;
-        char conv = i < len ? fmt[i] : '\0';
+        while (i < flen && strchr("lhztj", fmt[i])) i++;
+        char conv = (i < flen) ? fmt[i] : '\0';
         Cell arg;
         if (ai < nargs) arg = args[ai++];
         else { arg.n = 0; arg.s = 0; arg.is_str = 0; }
-        double val = arg.is_str ? 0.0 : arg.n;
+        double num = arg.n;
         if (conv == 'd' || conv == 'i') {
-            snprintf(buf, sizeof(buf), "%lld", nova_truncate_i64(val));
-            console_append(out, buf);
+            snprintf(out, sizeof(out), "%lld", truncate_ll(num));
+            console_append(vm, out);
+        } else if (conv == 'u') {
+            snprintf(out, sizeof(out), "%llu", to_unsigned32(num));
+            console_append(vm, out);
+        } else if (conv == 'x' || conv == 'X') {
+            snprintf(out, sizeof(out), conv == 'x' ? "%llx" : "%llX", to_unsigned32(num));
+            console_append(vm, out);
+        } else if (conv == 'o') {
+            snprintf(out, sizeof(out), "%llo", to_unsigned32(num));
+            console_append(vm, out);
+        } else if (conv == 'p') {
+            snprintf(out, sizeof(out), "0x%llx", to_unsigned32(num));
+            console_append(vm, out);
         } else if (conv == 'f') {
-            snprintf(buf, sizeof(buf), "%.*f", prec == -1 ? 6 : prec, val);
-            console_append(out, buf);
+            snprintf(out, sizeof(out), "%.*f", prec == -1 ? 6 : prec, num);
+            console_append(vm, out);
+        } else if (conv == 'e' || conv == 'E') {
+            snprintf(out, sizeof(out), conv == 'e' ? "%.*e" : "%.*E", prec == -1 ? 6 : prec, num);
+            console_append(vm, out);
+        } else if (conv == 'g' || conv == 'G') {
+            fmt_number(num, numbuf, sizeof(numbuf));
+            console_append(vm, numbuf);
         } else if (conv == 'c') {
-            char cbuf[2] = { (char)(nova_truncate_i64(val) & 0xff), '\0' };
-            console_append(out, cbuf);
+            char one[2] = { (char)(truncate_ll(num) & 0xff), '\0' };
+            console_append(vm, one);
         } else if (conv == 's') {
-            if (arg.is_str && vm->chunk->strings && arg.s >= 0 && arg.s < vm->chunk->strings->count) {
-                console_append(out, vm->chunk->strings->items[arg.s]);
-            } else {
-                snprintf(buf, sizeof(buf), "%lld", nova_truncate_i64(val));
-                console_append(out, buf);
+            long long addr = truncate_ll(num);
+            char sbuf[4096]; int slen = 0;
+            long long guard = 0;
+            while (addr >= 0 && addr < VM_MEM_MAX && guard < 4096) {
+                double c = vm->mem[addr];
+                if (c == 0) break;
+                if (slen < 4095) sbuf[slen++] = (char)c;
+                addr++; guard++;
             }
+            sbuf[slen] = '\0';
+            console_append(vm, sbuf);
         } else {
-            char ubuf[3] = { '%', conv, '\0' };
-            console_append(out, ubuf);
+            char one[3] = { '%', conv, '\0' };
+            console_append(vm, one);
         }
     }
 }
 
-VMResult* vm_execute(const BytecodeChunk* chunk, SemModel* sem,
-                     const char** inputs, int input_count, DiagList* diags) {
-    VMResult* r = (VMResult*)xcalloc(1, sizeof(VMResult));
-    r->runtime_diags = diags;
+/* ------------------------------- builtins -------------------------------- */
 
-    VM vm;
-    memset(&vm, 0, sizeof(VM));
-    vm.chunk = chunk;
-    vm.sem = sem;
-    vm.diags = diags;
-    vm.result = r;
-    vm.inputs = inputs;
-    vm.input_count = input_count;
-    vm.mem = (double*)xcalloc(VM_MEM_MAX, sizeof(double));
-    vm.stack = (Cell*)xmalloc(sizeof(Cell) * VM_STACK_MAX);
-    vm.frames = (Frame*)xmalloc(sizeof(Frame) * (VM_CALL_DEPTH_MAX + 1));
-    console_init(&vm.console);
-    vm.global_list = sem->globals.items;
-    vm.global_count = sem->globals.count;
+static int call_builtin(VM *vm, BcInstr *instr) {
+    const char *name = instr->symbol;
+    int nargs = (int)instr->operand;
+    if (vm->sp < nargs) { char m[128]; snprintf(m, sizeof(m), "Stack underflow in %s", name); vm_runtime_error(vm, m, instr->line); return 1; }
+    double args[16];
+    int na = nargs > 16 ? 16 : nargs;
+    for (int i = 0; i < na; i++) args[i] = vm->stack[vm->sp - nargs + i].n;
+    vm->sp -= nargs;
 
-    int main_pc = chunk_func_pc(chunk, "main");
-    if (main_pc < 0) {
-        vm_runtime_error(&vm, "No 'main' entry point in bytecode", 0);
-        goto done;
+    if (strcmp(name, "sqrt") == 0) { vm_push(vm, sqrt(args[0])); return 1; }
+    if (strcmp(name, "pow") == 0) { vm_push(vm, pow(args[0], args[1])); return 1; }
+    if (strcmp(name, "sin") == 0) { vm_push(vm, sin(args[0])); return 1; }
+    if (strcmp(name, "cos") == 0) { vm_push(vm, cos(args[0])); return 1; }
+    if (strcmp(name, "tan") == 0) { vm_push(vm, tan(args[0])); return 1; }
+    if (strcmp(name, "log") == 0) { vm_push(vm, log(args[0])); return 1; }
+    if (strcmp(name, "exp") == 0) { vm_push(vm, exp(args[0])); return 1; }
+    if (strcmp(name, "ceil") == 0) { vm_push(vm, ceil(args[0])); return 1; }
+    if (strcmp(name, "floor") == 0) { vm_push(vm, floor(args[0])); return 1; }
+    if (strcmp(name, "fabs") == 0) { vm_push(vm, fabs(args[0])); return 1; }
+    if (strcmp(name, "abs") == 0) { vm_push(vm, (double)llabs(truncate_ll(args[0]))); return 1; }
+    if (strcmp(name, "fmod") == 0) { vm_push(vm, fmod(args[0], args[1])); return 1; }
+    if (strcmp(name, "rand") == 0) {
+        vm->randState = (int)((unsigned)vm->randState * 1103515245u + 12345u);
+        vm_push(vm, (double)((unsigned)vm->randState >> 16 & 0x7fff));
+        return 1;
     }
-
-    {
-        int main_frame_size = frame_size_of(&vm, "main");
-        Frame* f = &vm.frames[vm.frame_count++];
-        strcpy(f->func, "main");
-        f->ret_pc = -1;
-        f->bp = sem->global_slot_count;
-        vm.mem_top = sem->global_slot_count + main_frame_size;
+    if (strcmp(name, "srand") == 0) { vm->randState = (int)truncate_ll(args[0]); vm_push(vm, 0); return 1; }
+    if (strcmp(name, "time") == 0) { vm_push(vm, 1700000000.0); return 1; }
+    if (strcmp(name, "exit") == 0) { vm->exitCode = (int)truncate_ll(args[0]); vm->halted = 1; return 1; }
+    if (strcmp(name, "assert") == 0) {
+        if (truncate_ll(args[0]) == 0) vm_runtime_error(vm, "Assertion failed", instr->line);
+        vm_push(vm, 0);
+        return 1;
     }
+    /* not a builtin: restore args */
+    for (int i = na - 1; i >= 0; i--) { vm->stack[vm->sp].n = args[i]; vm->stack[vm->sp].is_str = 0; vm->sp++; }
+    return 0;
+}
 
-    {
-        int pc = main_pc;
-        long long steps_executed = 0;
+/* ------------------------------ trace step -------------------------------- */
 
-        while (!vm.halted && pc < chunk->count) {
-            steps_executed++;
-            if (steps_executed > VM_MAX_STEPS) {
-                vm_runtime_error(&vm, "Execution step limit exceeded (possible infinite loop)", 0);
-                break;
-            }
-            const BInstr* instr = &chunk->code[pc];
-            record_step(&vm, pc, instr);
-            if (vm.halted) break;
+static void describe_instr(BcInstr *i, char *out, size_t n) {
+    char numbuf[64];
+    if (strcmp(i->op, "PUSH") == 0) { fmt_number(i->operand, numbuf, sizeof(numbuf)); snprintf(out, n, "PUSH %s", numbuf); }
+    else if (strcmp(i->op, "LOAD") == 0) snprintf(out, n, "LOAD %s", i->symbol);
+    else if (strcmp(i->op, "STORE") == 0) snprintf(out, n, "STORE %s", i->symbol);
+    else if (strcmp(i->op, "ADDR") == 0) { fmt_number(i->operand, numbuf, sizeof(numbuf)); snprintf(out, n, "ADDR %s+%s", i->symbol, numbuf); }
+    else if (strcmp(i->op, "JMP") == 0) snprintf(out, n, "JMP %s", i->symbol);
+    else if (strcmp(i->op, "JZ") == 0) snprintf(out, n, "JZ %s", i->symbol);
+    else if (strcmp(i->op, "CALL") == 0) snprintf(out, n, "CALL %s (%d args)", i->symbol, (int)i->operand);
+    else if (strcmp(i->op, "RET") == 0) snprintf(out, n, "RET");
+    else if (strcmp(i->op, "PRINT") == 0) snprintf(out, n, "PRINT");
+    else if (strcmp(i->op, "INPUT") == 0) snprintf(out, n, "INPUT");
+    else if (strcmp(i->op, "HALT") == 0) snprintf(out, n, "HALT");
+    else snprintf(out, n, "%s", i->op);
+}
 
-            if (strcmp(instr->op, "PUSH") == 0) { vm_push(&vm, instr->operand); pc++; }
-            else if (strcmp(instr->op, "PUSH_STR") == 0) { vm_push_str(&vm, (int)instr->operand); pc++; }
-            else if (strcmp(instr->op, "POP") == 0) { if (vm.sp > 0) vm.sp--; pc++; }
-            else if (strcmp(instr->op, "LOAD") == 0) {
-                int addr = instr->is_global ? instr->slot : vm.frames[vm.frame_count - 1].bp + instr->slot;
-                vm_push(&vm, vm.mem[addr]);
-                pc++;
+static int frame_size_of(VM *vm, const char *funcName) {
+    FuncDef *f = sem_find_function(vm->sem, funcName);
+    int base = f ? f->frame_size : 0;
+    return base + bc_temps_for(vm->bc, funcName);
+}
+
+static void record_step(VM *vm, int pc, BcInstr *instr) {
+    VMResult *r = vm->result;
+    if (r->count >= VM_TRACE_MAX_STEPS) { r->truncated = 1; return; }
+    if (r->count >= r->capacity) {
+        r->capacity = r->capacity ? r->capacity * 2 : 256;
+        r->steps = (VMStep *)xrealloc(r->steps, sizeof(VMStep) * (size_t)r->capacity);
+    }
+    VMStep *step = &r->steps[r->count++];
+    memset(step, 0, sizeof(VMStep));
+    step->pc = pc;
+    step->line = instr->line;
+    describe_instr(instr, step->instruction, sizeof(step->instruction));
+
+    step->stack_count = vm->sp;
+    step->stack = (double *)xmalloc(sizeof(double) * (vm->sp > 0 ? (size_t)vm->sp : 1));
+    for (int i = 0; i < vm->sp; i++) step->stack[i] = vm->stack[i].is_str ? 0 : vm->stack[i].n;
+
+    /* variables: globals + current frame locals (non-param), deduplicated by
+     * name to match the JS engine's Map-keyed frame (one entry per name, at
+     * its first-occurrence position, carrying the last declaration's slot). */
+    Frame *frame = vm->frame_count > 0 ? &vm->frames[vm->frame_count - 1] : NULL;
+    FuncDef *fdef = frame ? sem_find_function(vm->sem, frame->func) : NULL;
+    int nGlobals = vm->sem->globals.count;
+
+    SymRec **localRecs = NULL;
+    int nLocals = 0, localCap = 0;
+    if (fdef) {
+        for (int i = 0; i < fdef->frame.count; i++) {
+            SymRec *it = &fdef->frame.items[i];
+            if (it->isParam) continue;
+            int already = 0;
+            for (int k = 0; k < nLocals; k++) if (strcmp(localRecs[k]->name, it->name) == 0) { already = 1; break; }
+            if (already) continue;
+            SymRec *last = it;
+            for (int j = fdef->frame.count - 1; j >= 0; j--) {
+                if (strcmp(fdef->frame.items[j].name, it->name) == 0) { last = &fdef->frame.items[j]; break; }
             }
-            else if (strcmp(instr->op, "STORE") == 0) {
-                Cell v = vm_pop(&vm);
-                int addr = instr->is_global ? instr->slot : vm.frames[vm.frame_count - 1].bp + instr->slot;
-                vm.mem[addr] = v.n;
-                pc++;
+            if (nLocals >= localCap) {
+                localCap = localCap ? localCap * 2 : 16;
+                localRecs = (SymRec **)xrealloc(localRecs, sizeof(SymRec *) * (size_t)localCap);
             }
-            else if (strcmp(instr->op, "ADDR") == 0) {
-                int base = instr->is_global ? instr->slot : vm.frames[vm.frame_count - 1].bp + instr->slot;
-                vm_push(&vm, (double)(base + (int)instr->operand));
-                pc++;
-            }
-            else if (strcmp(instr->op, "IDX_ADDR") == 0) {
-                Cell idx_cell = vm_pop(&vm);
-                long long idx = nova_truncate_i64(idx_cell.n);
-                int base = instr->is_global ? instr->slot : vm.frames[vm.frame_count - 1].bp + instr->slot;
-                if (instr->array_size >= 0 && (idx < 0 || idx >= instr->array_size)) {
-                    char msg[128];
-                    snprintf(msg, sizeof(msg), "Array index %lld out of bounds (size %d)", idx, instr->array_size);
-                    vm_runtime_error(&vm, msg, instr->line);
-                    break;
-                }
-                vm_push(&vm, (double)(base + idx));
-                pc++;
-            }
-            else if (strcmp(instr->op, "LOAD_AT") == 0) {
-                Cell addr_cell = vm_pop(&vm);
-                long long addr = nova_truncate_i64(addr_cell.n);
-                if (addr < 0 || addr >= vm.mem_top) {
-                    char msg[128];
-                    snprintf(msg, sizeof(msg), "Invalid memory read at address %lld", addr);
-                    vm_runtime_error(&vm, msg, instr->line);
-                    break;
-                }
-                vm_push(&vm, vm.mem[addr]);
-                pc++;
-            }
-            else if (strcmp(instr->op, "STORE_AT") == 0) {
-                Cell addr_cell = vm_pop(&vm);
-                Cell val_cell = vm_pop(&vm);
-                long long addr = nova_truncate_i64(addr_cell.n);
-                if (addr < 0 || addr >= vm.mem_top) {
-                    char msg[128];
-                    snprintf(msg, sizeof(msg), "Invalid memory write at address %lld", addr);
-                    vm_runtime_error(&vm, msg, instr->line);
-                    break;
-                }
-                vm.mem[addr] = val_cell.n;
-                pc++;
-            }
-            else if (strcmp(instr->op, "ADD") == 0) { Cell b = vm_pop(&vm), a = vm_pop(&vm); vm_push(&vm, a.n + b.n); pc++; }
-            else if (strcmp(instr->op, "SUB") == 0) { Cell b = vm_pop(&vm), a = vm_pop(&vm); vm_push(&vm, a.n - b.n); pc++; }
-            else if (strcmp(instr->op, "MUL") == 0) { Cell b = vm_pop(&vm), a = vm_pop(&vm); vm_push(&vm, a.n * b.n); pc++; }
-            else if (strcmp(instr->op, "DIV") == 0) {
-                Cell b = vm_pop(&vm), a = vm_pop(&vm);
-                long long bi = nova_truncate_i64(b.n);
-                if (bi == 0) { vm_runtime_error(&vm, "Division by zero", instr->line); break; }
-                long long ai = nova_truncate_i64(a.n);
-                vm_push(&vm, (double)(ai / bi));
-                pc++;
-            }
-            else if (strcmp(instr->op, "DIVF") == 0) {
-                Cell b = vm_pop(&vm), a = vm_pop(&vm);
-                if (b.n == 0.0) { vm_runtime_error(&vm, "Division by zero", instr->line); break; }
-                vm_push(&vm, a.n / b.n);
-                pc++;
-            }
-            else if (strcmp(instr->op, "MOD") == 0) {
-                Cell b = vm_pop(&vm), a = vm_pop(&vm);
-                long long bi = nova_truncate_i64(b.n);
-                if (bi == 0) { vm_runtime_error(&vm, "Division by zero (modulo)", instr->line); break; }
-                long long ai = nova_truncate_i64(a.n);
-                vm_push(&vm, (double)(ai % bi));
-                pc++;
-            }
-            else if (strcmp(instr->op, "NEG") == 0) { Cell a = vm_pop(&vm); vm_push(&vm, -a.n); pc++; }
-            else if (strcmp(instr->op, "NOT") == 0) { Cell a = vm_pop(&vm); vm_push(&vm, a.n == 0.0 ? 1.0 : 0.0); pc++; }
-            else if (strcmp(instr->op, "EQ") == 0) { Cell b = vm_pop(&vm), a = vm_pop(&vm); vm_push(&vm, a.n == b.n ? 1.0 : 0.0); pc++; }
-            else if (strcmp(instr->op, "NEQ") == 0) { Cell b = vm_pop(&vm), a = vm_pop(&vm); vm_push(&vm, a.n != b.n ? 1.0 : 0.0); pc++; }
-            else if (strcmp(instr->op, "LT") == 0) { Cell b = vm_pop(&vm), a = vm_pop(&vm); vm_push(&vm, a.n < b.n ? 1.0 : 0.0); pc++; }
-            else if (strcmp(instr->op, "GT") == 0) { Cell b = vm_pop(&vm), a = vm_pop(&vm); vm_push(&vm, a.n > b.n ? 1.0 : 0.0); pc++; }
-            else if (strcmp(instr->op, "LEQ") == 0) { Cell b = vm_pop(&vm), a = vm_pop(&vm); vm_push(&vm, a.n <= b.n ? 1.0 : 0.0); pc++; }
-            else if (strcmp(instr->op, "GEQ") == 0) { Cell b = vm_pop(&vm), a = vm_pop(&vm); vm_push(&vm, a.n >= b.n ? 1.0 : 0.0); pc++; }
-            else if (strcmp(instr->op, "AND") == 0) { Cell b = vm_pop(&vm), a = vm_pop(&vm); vm_push(&vm, (a.n != 0.0 && b.n != 0.0) ? 1.0 : 0.0); pc++; }
-            else if (strcmp(instr->op, "OR") == 0) { Cell b = vm_pop(&vm), a = vm_pop(&vm); vm_push(&vm, (a.n != 0.0 || b.n != 0.0) ? 1.0 : 0.0); pc++; }
-            else if (strcmp(instr->op, "JMP") == 0) { pc = (int)instr->operand; }
-            else if (strcmp(instr->op, "JZ") == 0) {
-                Cell v = vm_pop(&vm);
-                pc = (v.n == 0.0) ? (int)instr->operand : pc + 1;
-            }
-            else if (strcmp(instr->op, "CALL") == 0) {
-                int target = chunk_func_pc(chunk, instr->symbol);
-                if (target < 0) {
-                    char msg[300];
-                    snprintf(msg, sizeof(msg), "Call to undefined function '%s'", instr->symbol);
-                    vm_runtime_error(&vm, msg, instr->line);
-                    break;
-                }
-                if (vm.frame_count >= VM_CALL_DEPTH_MAX) {
-                    vm_runtime_error(&vm, "Call stack overflow (recursion too deep)", instr->line);
-                    break;
-                }
-                int nargs = (int)instr->operand;
-                if (vm.sp < nargs) { vm_runtime_error(&vm, "Stack underflow in CALL", instr->line); break; }
-                int bp = vm.mem_top;
-                int fsize = frame_size_of(&vm, instr->symbol);
-                if (bp + fsize >= VM_MEM_MAX) {
-                    vm_runtime_error(&vm, "Memory exhausted (too many locals/frames)", instr->line);
-                    break;
-                }
-                for (int i = 0; i < nargs; i++) {
-                    Cell cell = vm.stack[vm.sp - nargs + i];
-                    vm.mem[bp + i] = cell.n;
-                }
-                vm.sp -= nargs;
-                Frame* f = &vm.frames[vm.frame_count++];
-                snprintf(f->func, sizeof(f->func), "%s", instr->symbol);
-                f->func[sizeof(f->func) - 1] = '\0';
-                f->ret_pc = pc + 1;
-                f->bp = bp;
-                vm.mem_top = bp + fsize;
-                pc = target;
-            }
-            else if (strcmp(instr->op, "RET") == 0) {
-                int has_val = instr->operand == 1.0;
-                Cell ret_val;
-                ret_val.n = 0; ret_val.s = 0; ret_val.is_str = 0;
-                if (has_val) ret_val = vm_pop(&vm);
-                if (vm.frame_count == 0) { vm_runtime_error(&vm, "RET with empty call stack", instr->line); break; }
-                Frame frame = vm.frames[--vm.frame_count];
-                vm.mem_top = frame.bp;
-                if (vm.frame_count == 0) {
-                    r->exit_code = (int)nova_truncate_i64(ret_val.n);
-                    vm.halted = 1;
-                    break;
-                }
-                vm_push(&vm, ret_val.n);
-                pc = frame.ret_pc;
-            }
-            else if (strcmp(instr->op, "PRINT") == 0) {
-                int nargs = (int)instr->operand;
-                if (vm.sp < nargs) { vm_runtime_error(&vm, "Stack underflow in PRINT", instr->line); break; }
-                Cell* args = (Cell*)xmalloc(sizeof(Cell) * (size_t)(nargs > 0 ? nargs : 1));
-                for (int i = 0; i < nargs; i++) args[i] = vm.stack[vm.sp - nargs + i];
-                vm.sp -= nargs;
-                const char* fmt = (instr->fmt_idx >= 0 && chunk->strings && instr->fmt_idx < chunk->strings->count)
-                    ? chunk->strings->items[instr->fmt_idx] : "";
-                format_printf(&vm, fmt, args, nargs, &vm.console);
-                free(args);
-                pc++;
-            }
-            else if (strcmp(instr->op, "INPUT") == 0) {
-                int ntargets = (int)instr->operand;
-                if (vm.sp < ntargets) { vm_runtime_error(&vm, "Stack underflow in INPUT", instr->line); break; }
-                if (vm.input_idx + ntargets > vm.input_count) {
-                    r->waiting_for_input = 1;
-                    const char* fmt = (instr->fmt_idx >= 0 && chunk->strings && instr->fmt_idx < chunk->strings->count)
-                        ? chunk->strings->items[instr->fmt_idx] : "%d";
-                    snprintf(r->input_prompt, sizeof(r->input_prompt),
-                             "Enter %d value(s) for scanf (%s)", ntargets, fmt);
-                    vm.halted = 1;
-                    break;
-                }
-                Cell addrs[16];
-                int take = ntargets > 16 ? 16 : ntargets;
-                for (int i = 0; i < take; i++) addrs[i] = vm.stack[vm.sp - ntargets + i];
-                vm.sp -= ntargets;
-                const char* fmt = (instr->fmt_idx >= 0 && chunk->strings && instr->fmt_idx < chunk->strings->count)
-                    ? chunk->strings->items[instr->fmt_idx] : "%d";
-                for (int i = 0; i < take; i++) {
-                    /* trim */
-                    const char* raw = vm.inputs[vm.input_idx++];
-                    char buf[256];
-                    int si = 0;
-                    while (*raw == ' ' || *raw == '\t' || *raw == '\n' || *raw == '\r') raw++;
-                    while (raw[si] && si < 255) { buf[si] = raw[si]; si++; }
-                    buf[si] = '\0';
-                    while (si > 0 && (buf[si - 1] == ' ' || buf[si - 1] == '\t' || buf[si - 1] == '\n' || buf[si - 1] == '\r')) buf[--si] = '\0';
-                    char* endp = NULL;
-                    double val = strtod(buf, &endp);
-                    if (endp == buf) val = 0; /* NaN -> 0, mirrors JS */
-                    if (strstr(fmt, "%d") && i == 0) val = (double)nova_truncate_i64(val);
-                    long long addr = nova_truncate_i64(addrs[i].n);
-                    if (addr < 0 || addr >= vm.mem_top) {
-                        char msg[128];
-                        snprintf(msg, sizeof(msg), "Invalid scanf target address %lld", addr);
-                        vm_runtime_error(&vm, msg, instr->line);
-                        break;
-                    }
-                    vm.mem[addr] = val;
-                }
-                if (vm.halted) break;
-                pc++;
-            }
-            else if (strcmp(instr->op, "HALT") == 0) { vm.halted = 1; }
-            else { pc++; }
+            localRecs[nLocals++] = last;
         }
     }
 
-done:
-    r->console_output = xstrdup(vm.console.data);
+    step->var_count = nGlobals + nLocals;
+    step->variables = xmalloc(sizeof(*step->variables) * (step->var_count > 0 ? (size_t)step->var_count : 1));
+    int vi = 0;
+    for (int i = 0; i < nGlobals; i++) {
+        strncpy(step->variables[vi].name, vm->sem->globals.items[i].name, sizeof(step->variables[vi].name) - 1);
+        step->variables[vi].value = vm->mem[vm->sem->globals.items[i].offset];
+        vi++;
+    }
+    for (int k = 0; k < nLocals; k++) {
+        strncpy(step->variables[vi].name, localRecs[k]->name, sizeof(step->variables[vi].name) - 1);
+        step->variables[vi].value = vm->mem[frame->bp + localRecs[k]->offset];
+        vi++;
+    }
+    free(localRecs);
+
+    step->frame_count = vm->frame_count;
+    step->frames = xmalloc(sizeof(*step->frames) * (vm->frame_count > 0 ? (size_t)vm->frame_count : 1));
+    for (int i = 0; i < vm->frame_count; i++) {
+        snprintf(step->frames[i].func, sizeof(step->frames[i].func), "%s()", vm->frames[i].func);
+        int rpc = vm->frames[i].retPC > 0 ? vm->frames[i].retPC : 0;
+        snprintf(step->frames[i].retAddr, sizeof(step->frames[i].retAddr), "0x%04X", (unsigned)rpc);
+    }
+
+    step->console = xstrdup(vm->console ? vm->console : "");
+}
+
+/* --------------------------------- run ------------------------------------ */
+
+VMResult *nova_vm_run(BcResult *bc, SemResult *sem, const char **inputs, int input_count) {
+    VMResult *r = (VMResult *)xcalloc(1, sizeof(VMResult));
+    r->runtimeDiags = diag_list_new();
+    r->consoleOutput = xstrdup("");
+
+    VM vm; memset(&vm, 0, sizeof(vm));
+    vm.mem = (double *)xcalloc(VM_MEM_MAX, sizeof(double));
+    vm.stack = (Cell *)xmalloc(sizeof(Cell) * VM_STACK_MAX);
+    vm.frames = (Frame *)xmalloc(sizeof(Frame) * (VM_CALL_DEPTH_MAX + 1));
+    vm.console = xstrdup("");
+    vm.console_cap = 1;
+    vm.randState = 1;
+    vm.inputs = inputs;
+    vm.input_count = input_count;
+    vm.runtimeDiags = r->runtimeDiags;
+    vm.result = r;
+    vm.bc = bc;
+    vm.sem = sem;
+
+    int mainPC = bc_func_pc(bc, "main");
+    if (mainPC < 0) {
+        vm_runtime_error(&vm, "No 'main' entry point in bytecode", 0);
+        r->consoleOutput = xstrdup(vm.console);
+        free(vm.mem); free(vm.stack); free(vm.frames); free(vm.console);
+        return r;
+    }
+
+    /* intern string literals into memory */
+    vm.strBase_count = bc->string_count;
+    vm.strBase = (int *)xmalloc(sizeof(int) * (bc->string_count > 0 ? (size_t)bc->string_count : 1));
+    int cursor = sem->globalSlotCount;
+    for (int si = 0; si < bc->string_count; si++) {
+        vm.strBase[si] = cursor;
+        const char *s = bc->strings[si];
+        size_t slen = strlen(s);
+        for (size_t k = 0; k < slen && cursor < VM_MEM_MAX; k++) vm.mem[cursor++] = (double)(unsigned char)s[k];
+        if (cursor < VM_MEM_MAX) vm.mem[cursor++] = 0;
+    }
+
+    int mainBP = cursor;
+    vm.frames[vm.frame_count].retPC = -1;
+    strcpy(vm.frames[vm.frame_count].func, "main");
+    vm.frames[vm.frame_count].bp = mainBP;
+    vm.frame_count++;
+    int memTop = mainBP + frame_size_of(&vm, "main");
+    int pc = mainPC;
+    long long stepsExecuted = 0;
+
+    while (!vm.halted && pc < bc->count) {
+        stepsExecuted++;
+        if (stepsExecuted > VM_MAX_STEPS) {
+            vm_runtime_error(&vm, "Execution step limit exceeded (possible infinite loop)", 0);
+            break;
+        }
+        BcInstr *instr = &bc->items[pc];
+        record_step(&vm, pc, instr);
+        if (vm.halted) break;
+
+        const char *op = instr->op;
+        do {
+        if (strcmp(op, "PUSH") == 0) { vm_push(&vm, instr->operand); pc++; }
+        else if (strcmp(op, "PUSH_STR") == 0) {
+            int idx = (int)instr->operand;
+            vm_push(&vm, (idx >= 0 && idx < vm.strBase_count) ? (double)vm.strBase[idx] : 0.0);
+            pc++;
+        }
+        else if (strcmp(op, "POP") == 0) { if (vm.sp > 0) vm.sp--; pc++; }
+        else if (strcmp(op, "LOAD") == 0) {
+            int addr = instr->isGlobal ? instr->slot : vm.frames[vm.frame_count - 1].bp + instr->slot;
+            vm_push(&vm, vm.mem[addr]);
+            pc++;
+        }
+        else if (strcmp(op, "STORE") == 0) {
+            Cell v = vm_pop(&vm);
+            int addr = instr->isGlobal ? instr->slot : vm.frames[vm.frame_count - 1].bp + instr->slot;
+            vm.mem[addr] = v.n;
+            pc++;
+        }
+        else if (strcmp(op, "ADDR") == 0) {
+            int base = instr->isGlobal ? instr->slot : vm.frames[vm.frame_count - 1].bp + instr->slot;
+            vm_push(&vm, (double)(base + (int)instr->operand));
+            pc++;
+        }
+        else if (strcmp(op, "IDX_ADDR") == 0) {
+            Cell idxCell = vm_pop(&vm);
+            long long idx = truncate_ll(idxCell.n);
+            int base = instr->isGlobal ? instr->slot : vm.frames[vm.frame_count - 1].bp + instr->slot;
+            int size = (int)instr->operand;
+            if (size >= 0 && (idx < 0 || idx >= size)) {
+                char m[128]; snprintf(m, sizeof(m), "Array index %lld out of bounds (size %d)", idx, size);
+                vm_runtime_error(&vm, m, instr->line);
+                break;
+            }
+            vm_push(&vm, (double)(base + idx));
+            pc++;
+        }
+        else if (strcmp(op, "LOAD_AT") == 0) {
+            Cell addrCell = vm_pop(&vm);
+            long long addr = truncate_ll(addrCell.n);
+            if (addr < 0 || addr >= memTop) {
+                char m[128]; snprintf(m, sizeof(m), "Invalid memory read at address %lld", addr);
+                vm_runtime_error(&vm, m, instr->line);
+                break;
+            }
+            vm_push(&vm, vm.mem[addr]);
+            pc++;
+        }
+        else if (strcmp(op, "STORE_AT") == 0) {
+            Cell addrCell = vm_pop(&vm);
+            Cell valCell = vm_pop(&vm);
+            long long addr = truncate_ll(addrCell.n);
+            if (addr < 0 || addr >= memTop) {
+                char m[128]; snprintf(m, sizeof(m), "Invalid memory write at address %lld", addr);
+                vm_runtime_error(&vm, m, instr->line);
+                break;
+            }
+            vm.mem[addr] = valCell.n;
+            pc++;
+        }
+        else if (strcmp(op, "ADD") == 0) { Cell b = vm_pop(&vm), a = vm_pop(&vm); vm_push(&vm, a.n + b.n); pc++; }
+        else if (strcmp(op, "SUB") == 0) { Cell b = vm_pop(&vm), a = vm_pop(&vm); vm_push(&vm, a.n - b.n); pc++; }
+        else if (strcmp(op, "MUL") == 0) { Cell b = vm_pop(&vm), a = vm_pop(&vm); vm_push(&vm, a.n * b.n); pc++; }
+        else if (strcmp(op, "DIV") == 0) {
+            Cell b = vm_pop(&vm), a = vm_pop(&vm);
+            long long bi = truncate_ll(b.n);
+            if (bi == 0) { vm_runtime_error(&vm, "Division by zero", instr->line); break; }
+            vm_push(&vm, (double)(truncate_ll(a.n) / bi));
+            pc++;
+        }
+        else if (strcmp(op, "DIVF") == 0) {
+            Cell b = vm_pop(&vm), a = vm_pop(&vm);
+            if (b.n == 0) { vm_runtime_error(&vm, "Division by zero", instr->line); break; }
+            vm_push(&vm, a.n / b.n);
+            pc++;
+        }
+        else if (strcmp(op, "MOD") == 0) {
+            Cell b = vm_pop(&vm), a = vm_pop(&vm);
+            long long bi = truncate_ll(b.n);
+            if (bi == 0) { vm_runtime_error(&vm, "Division by zero (modulo)", instr->line); break; }
+            vm_push(&vm, (double)(truncate_ll(a.n) % bi));
+            pc++;
+        }
+        else if (strcmp(op, "NEG") == 0) { Cell a = vm_pop(&vm); vm_push(&vm, -a.n); pc++; }
+        else if (strcmp(op, "NOT") == 0) { Cell a = vm_pop(&vm); vm_push(&vm, a.n == 0 ? 1.0 : 0.0); pc++; }
+        else if (strcmp(op, "EQ") == 0) { Cell b = vm_pop(&vm), a = vm_pop(&vm); vm_push(&vm, a.n == b.n ? 1.0 : 0.0); pc++; }
+        else if (strcmp(op, "NEQ") == 0) { Cell b = vm_pop(&vm), a = vm_pop(&vm); vm_push(&vm, a.n != b.n ? 1.0 : 0.0); pc++; }
+        else if (strcmp(op, "LT") == 0) { Cell b = vm_pop(&vm), a = vm_pop(&vm); vm_push(&vm, a.n < b.n ? 1.0 : 0.0); pc++; }
+        else if (strcmp(op, "GT") == 0) { Cell b = vm_pop(&vm), a = vm_pop(&vm); vm_push(&vm, a.n > b.n ? 1.0 : 0.0); pc++; }
+        else if (strcmp(op, "LEQ") == 0) { Cell b = vm_pop(&vm), a = vm_pop(&vm); vm_push(&vm, a.n <= b.n ? 1.0 : 0.0); pc++; }
+        else if (strcmp(op, "GEQ") == 0) { Cell b = vm_pop(&vm), a = vm_pop(&vm); vm_push(&vm, a.n >= b.n ? 1.0 : 0.0); pc++; }
+        else if (strcmp(op, "AND") == 0) { Cell b = vm_pop(&vm), a = vm_pop(&vm); vm_push(&vm, (a.n != 0 && b.n != 0) ? 1.0 : 0.0); pc++; }
+        else if (strcmp(op, "OR") == 0) { Cell b = vm_pop(&vm), a = vm_pop(&vm); vm_push(&vm, (a.n != 0 || b.n != 0) ? 1.0 : 0.0); pc++; }
+        else if (strcmp(op, "BAND") == 0) { Cell b = vm_pop(&vm), a = vm_pop(&vm); vm_push(&vm, (double)((int)truncate_ll(a.n) & (int)truncate_ll(b.n))); pc++; }
+        else if (strcmp(op, "BOR") == 0) { Cell b = vm_pop(&vm), a = vm_pop(&vm); vm_push(&vm, (double)((int)truncate_ll(a.n) | (int)truncate_ll(b.n))); pc++; }
+        else if (strcmp(op, "BXOR") == 0) { Cell b = vm_pop(&vm), a = vm_pop(&vm); vm_push(&vm, (double)((int)truncate_ll(a.n) ^ (int)truncate_ll(b.n))); pc++; }
+        else if (strcmp(op, "BNOT") == 0) { Cell a = vm_pop(&vm); vm_push(&vm, (double)(~(int)truncate_ll(a.n))); pc++; }
+        else if (strcmp(op, "SHL") == 0) { Cell b = vm_pop(&vm), a = vm_pop(&vm); vm_push(&vm, (double)((int)truncate_ll(a.n) << ((int)truncate_ll(b.n) & 31))); pc++; }
+        else if (strcmp(op, "SHR") == 0) { Cell b = vm_pop(&vm), a = vm_pop(&vm); vm_push(&vm, (double)((int)truncate_ll(a.n) >> ((int)truncate_ll(b.n) & 31))); pc++; }
+        else if (strcmp(op, "CVT_I") == 0) { Cell a = vm_pop(&vm); vm_push(&vm, (double)truncate_ll(a.n)); pc++; }
+        else if (strcmp(op, "CVT_F") == 0) { Cell a = vm_pop(&vm); vm_push(&vm, a.n); pc++; }
+        else if (strcmp(op, "JMP") == 0) { pc = (int)instr->operand; }
+        else if (strcmp(op, "JZ") == 0) { Cell v = vm_pop(&vm); pc = (v.n == 0) ? (int)instr->operand : pc + 1; }
+        else if (strcmp(op, "CALL") == 0) {
+            int target = bc_func_pc(bc, instr->symbol);
+            if (target < 0) {
+                if (call_builtin(&vm, instr)) { pc++; break; }
+                char m[256]; snprintf(m, sizeof(m), "Call to undefined function '%s'", instr->symbol);
+                vm_runtime_error(&vm, m, instr->line);
+                break;
+            }
+            if (vm.frame_count >= VM_CALL_DEPTH_MAX) { vm_runtime_error(&vm, "Call stack overflow (recursion too deep)", instr->line); break; }
+            int nargs = (int)instr->operand;
+            if (vm.sp < nargs) { vm_runtime_error(&vm, "Stack underflow in CALL", instr->line); break; }
+            int bp = memTop;
+            int fsize = frame_size_of(&vm, instr->symbol);
+            if (bp + fsize >= VM_MEM_MAX) { vm_runtime_error(&vm, "Memory exhausted (too many locals/frames)", instr->line); break; }
+            for (int i = 0; i < nargs; i++) vm.mem[bp + i] = vm.stack[vm.sp - nargs + i].n;
+            vm.sp -= nargs;
+            strcpy(vm.frames[vm.frame_count].func, instr->symbol);
+            vm.frames[vm.frame_count].retPC = pc + 1;
+            vm.frames[vm.frame_count].bp = bp;
+            vm.frame_count++;
+            memTop = bp + fsize;
+            pc = target;
+        }
+        else if (strcmp(op, "RET") == 0) {
+            int hasVal = ((int)instr->operand == 1);
+            Cell retVal; retVal.n = 0; retVal.s = 0; retVal.is_str = 0;
+            if (hasVal) retVal = vm_pop(&vm);
+            if (vm.frame_count == 0) { vm_runtime_error(&vm, "RET with empty call stack", instr->line); break; }
+            vm.frame_count--;
+            Frame frame = vm.frames[vm.frame_count];
+            memTop = frame.bp;
+            if (vm.frame_count == 0) {
+                vm.exitCode = (int)truncate_ll(retVal.n);
+                vm.halted = 1;
+                break;
+            }
+            vm_push(&vm, retVal.n);
+            pc = frame.retPC;
+        }
+        else if (strcmp(op, "PRINT") == 0) {
+            int nargs = (int)instr->operand;
+            if (vm.sp < nargs) { vm_runtime_error(&vm, "Stack underflow in PRINT", instr->line); break; }
+            Cell *args = (Cell *)xmalloc(sizeof(Cell) * (nargs > 0 ? (size_t)nargs : 1));
+            for (int i = 0; i < nargs; i++) args[i] = vm.stack[vm.sp - nargs + i];
+            vm.sp -= nargs;
+            const char *fmt = (instr->fmtIdx >= 0 && instr->fmtIdx < bc->string_count) ? bc->strings[instr->fmtIdx] : "";
+            format_printf(&vm, fmt, args, nargs);
+            free(args);
+            pc++;
+        }
+        else if (strcmp(op, "INPUT") == 0) {
+            int nTargets = (int)instr->operand;
+            if (vm.sp < nTargets) { vm_runtime_error(&vm, "Stack underflow in INPUT", instr->line); break; }
+            if (vm.inputIdx + nTargets > vm.input_count) {
+                vm.waitingForInput = 1;
+                const char *fmt = (instr->fmtIdx >= 0 && instr->fmtIdx < bc->string_count) ? bc->strings[instr->fmtIdx] : "%d";
+                snprintf(vm.inputPrompt, sizeof(vm.inputPrompt), "Enter %d value(s) for scanf (%s)", nTargets, fmt);
+                vm.halted = 1;
+                break;
+            }
+            Cell addrs[16];
+            int na = nTargets > 16 ? 16 : nTargets;
+            for (int i = 0; i < na; i++) addrs[i] = vm.stack[vm.sp - nTargets + i];
+            vm.sp -= nTargets;
+            const char *fmt = (instr->fmtIdx >= 0 && instr->fmtIdx < bc->string_count) ? bc->strings[instr->fmtIdx] : "%d";
+            for (int i = 0; i < na; i++) {
+                const char *raw = vm.inputs[vm.inputIdx++];
+                char buf[256];
+                strncpy(buf, raw, sizeof(buf) - 1); buf[sizeof(buf) - 1] = '\0';
+                /* trim */
+                char *s = buf; while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r') s++;
+                char *endp = NULL;
+                double val = strtod(s, &endp);
+                if (endp == s) val = 0;
+                if (strstr(fmt, "%d") && i == 0) val = (double)truncate_ll(val);
+                long long addr = truncate_ll(addrs[i].n);
+                if (addr < 0 || addr >= memTop) {
+                    char m[128]; snprintf(m, sizeof(m), "Invalid scanf target address %lld", addr);
+                    vm_runtime_error(&vm, m, instr->line);
+                    break;
+                }
+                vm.mem[addr] = val;
+            }
+            if (vm.halted) break;
+            pc++;
+        }
+        else if (strcmp(op, "HALT") == 0) { vm.halted = 1; }
+        else { pc++; }
+        } while (0);
+    }
+
+    /* finalize result */
+    r->exitCode = vm.exitCode;
+    r->waitingForInput = vm.waitingForInput;
+    strncpy(r->inputPrompt, vm.inputPrompt, sizeof(r->inputPrompt) - 1);
+    free(r->consoleOutput);
+    r->consoleOutput = xstrdup(vm.console);
+
+    free(vm.strBase);
     free(vm.mem);
     free(vm.stack);
     free(vm.frames);
-    free(vm.console.data);
+    free(vm.console);
     return r;
 }
 
-void vm_result_free(VMResult* r) {
-    if (!r) return;
-    for (int i = 0; i < r->count; i++) {
-        free(r->steps[i].instruction);
-        free(r->steps[i].stack);
-        free(r->steps[i].variables);
-        free(r->steps[i].frames);
-        free(r->steps[i].console);
+void nova_vm_free(VMResult *v) {
+    if (!v) return;
+    for (int i = 0; i < v->count; i++) {
+        free(v->steps[i].stack);
+        free(v->steps[i].variables);
+        free(v->steps[i].frames);
+        free(v->steps[i].console);
     }
-    free(r->steps);
-    free(r->console_output);
-    free(r);
+    free(v->steps);
+    free(v->consoleOutput);
+    diag_list_free(v->runtimeDiags);
+    free(v);
 }

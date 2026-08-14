@@ -1,395 +1,363 @@
-#include "bytecode.h"
+#include "compile.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
 
-static void* xmalloc(size_t n) { void* p = malloc(n); if (!p) { fprintf(stderr, "nova: out of memory\n"); exit(1); } return p; }
-static void* xrealloc(void* p, size_t n) { void* q = realloc(p, n); if (!q) { fprintf(stderr, "nova: out of memory\n"); exit(1); } return q; }
-static void* xcalloc(size_t n, size_t s) { void* p = calloc(n, s); if (!p) { fprintf(stderr, "nova: out of memory\n"); exit(1); } return p; }
-
-/* temp-slot map used during codegen */
-typedef struct { char name[64]; int offset; } TempSlot;
-typedef struct {
-    char func[256];
-    TempSlot* items;
-    int count;
-    int capacity;
-} FuncTemps;
+static void *xcalloc(size_t n, size_t s) { void *p = calloc(n, s); if (!p) { fprintf(stderr, "nova: out of memory\n"); exit(1); } return p; }
+static void *xrealloc(void *p, size_t n) { void *q = realloc(p, n); if (!q) { fprintf(stderr, "nova: out of memory\n"); exit(1); } return q; }
 
 typedef struct {
-    FuncTemps* items;
-    int count;
-    int capacity;
-} FuncTempsList;
+    BcResult *r;
+    SemResult *sem;
+    char currentFunc[256];
+    /* labelPC */
+    char (*labelNames)[64]; int *labelPCs; int label_count, label_capacity;
+    /* fixups */
+    struct { int index; char label[64]; } *fixups; int fixup_count, fixup_capacity;
+    /* tempSlots per function */
+    struct { char func[256]; char (*names)[64]; int *slots; int count, capacity; } *funcTemps; int funcTemp_count, funcTemp_capacity;
+} BG;
 
-static FuncTemps* ftemps_for(FuncTempsList* l, const char* func) {
-    for (int i = 0; i < l->count; i++) {
-        if (strcmp(l->items[i].func, func) == 0) return &l->items[i];
-    }
-    if (l->count >= l->capacity) {
-        l->capacity = l->capacity ? l->capacity * 2 : 8;
-        l->items = (FuncTemps*)xrealloc(l->items, sizeof(FuncTemps) * (size_t)l->capacity);
-    }
-    FuncTemps* ft = &l->items[l->count++];
-    memset(ft, 0, sizeof(FuncTemps));
-    snprintf(ft->func, sizeof(ft->func), "%s", func);
-    ft->capacity = 16;
-    ft->items = (TempSlot*)xmalloc(sizeof(TempSlot) * (size_t)ft->capacity);
-    return ft;
-}
-
-typedef struct {
-    int is_global;
-    int slot;
-    int size;
-} PlaceInfo;
-
-typedef struct {
-    BytecodeChunk* chunk;
-    SemModel* sem;
-    const TempTypeList* temp_types;
-    DiagList* diags;
-    char current_func[256];
-    FuncTempsList ftemps;
-    FuncDef* current_fdef;
-} BC;
-
-static BInstr* emit_instr(BC* bc, const char* op, double operand, const char* symbol, int line) {
-    BytecodeChunk* c = bc->chunk;
-    if (c->count >= c->capacity) {
-        c->capacity *= 2;
-        c->code = (BInstr*)xrealloc(c->code, sizeof(BInstr) * (size_t)c->capacity);
-    }
-    BInstr* ins = &c->code[c->count];
-    memset(ins, 0, sizeof(BInstr));
-    ins->pc = c->count;
-    snprintf(ins->op, sizeof(ins->op), "%s", op);
-    ins->operand = operand;
-    if (symbol) snprintf(ins->symbol, sizeof(ins->symbol), "%s", symbol);
-    ins->line = line;
-    c->count++;
-    return ins;
-}
-
-static int is_numeric_place(const char* p) {
+static int is_numeric_place(const char *p) {
     if (!p || !*p) return 0;
     int i = (p[0] == '-') ? 1 : 0;
-    int digits = 0, dot = 0;
+    int digits = 0, dots = 0;
     for (; p[i]; i++) {
         if (isdigit((unsigned char)p[i])) digits++;
-        else if (p[i] == '.' && !dot) dot = 1;
+        else if (p[i] == '.' && dots == 0) dots++;
         else return 0;
     }
     return digits > 0;
 }
 
-static int is_float_literal_place(const char* p) {
-    /* matches JS /^-?\d+\.\d+$/ */
-    if (!p) return 0;
-    int i = (p[0] == '-') ? 1 : 0;
-    int d1 = 0;
-    while (isdigit((unsigned char)p[i])) { d1++; i++; }
-    if (!d1 || p[i] != '.') return 0;
-    i++;
-    int d2 = 0;
-    while (isdigit((unsigned char)p[i])) { d2++; i++; }
-    return d2 > 0 && p[i] == '\0';
+static BcInstr *emit_instr(BG *bg, const char *op, double operand, const char *symbol, int line) {
+    BcResult *r = bg->r;
+    if (r->count >= r->capacity) {
+        r->capacity = r->capacity ? r->capacity * 2 : 128;
+        r->items = (BcInstr *)xrealloc(r->items, sizeof(BcInstr) * (size_t)r->capacity);
+    }
+    BcInstr *ins = &r->items[r->count];
+    memset(ins, 0, sizeof(BcInstr));
+    ins->pc = r->count;
+    strncpy(ins->op, op, sizeof(ins->op) - 1);
+    ins->operand = operand;
+    if (symbol) strncpy(ins->symbol, symbol, sizeof(ins->symbol) - 1);
+    ins->line = line;
+    r->count++;
+    return ins;
 }
 
-static PlaceInfo place_info(BC* bc, const char* place) {
-    PlaceInfo info;
-    memset(&info, 0, sizeof(info));
-    SymRec* g = sem_find_global(bc->sem, place);
-    if (g) {
-        info.is_global = 1;
-        info.slot = g->offset;
-        info.size = g->size;
-        return info;
-    }
-    if (bc->current_fdef) {
-        SymRec* r = reclist_find_pub(&bc->current_fdef->frame, place);
-        if (r) {
-            info.is_global = 0;
-            info.slot = r->offset;
-            info.size = r->size;
-            return info;
+typedef struct { int isGlobal; int slot; int size; } PlaceInfo;
+
+static PlaceInfo place_info(BG *bg, const char *place) {
+    PlaceInfo info; memset(&info, 0, sizeof(info));
+    SymRec *g = sem_find_global(bg->sem, place);
+    if (g) { info.isGlobal = 1; info.slot = g->offset; info.size = g->size; return info; }
+    FuncDef *f = sem_find_function(bg->sem, bg->currentFunc);
+    if (f) {
+        SymRec *r = sem_find_in_frame(f, place);
+        if (r) { info.isGlobal = 0; info.slot = r->offset; info.size = r->size; return info; }
+        /* temp slot */
+        int ftIdx = -1;
+        for (int i = 0; i < bg->funcTemp_count; i++) {
+            if (strcmp(bg->funcTemps[i].func, bg->currentFunc) == 0) { ftIdx = i; break; }
         }
-        FuncTemps* ft = ftemps_for(&bc->ftemps, bc->current_func);
-        for (int i = 0; i < ft->count; i++) {
-            if (strcmp(ft->items[i].name, place) == 0) {
-                info.is_global = 0;
-                info.slot = ft->items[i].offset;
-                info.size = 1;
+        if (ftIdx < 0) {
+            if (bg->funcTemp_count >= bg->funcTemp_capacity) {
+                bg->funcTemp_capacity = bg->funcTemp_capacity ? bg->funcTemp_capacity * 2 : 8;
+                bg->funcTemps = xrealloc(bg->funcTemps, sizeof(*bg->funcTemps) * (size_t)bg->funcTemp_capacity);
+            }
+            ftIdx = bg->funcTemp_count++;
+            memset(&bg->funcTemps[ftIdx], 0, sizeof(bg->funcTemps[ftIdx]));
+            strncpy(bg->funcTemps[ftIdx].func, bg->currentFunc, 255);
+        }
+        for (int i = 0; i < bg->funcTemps[ftIdx].count; i++) {
+            if (strcmp(bg->funcTemps[ftIdx].names[i], place) == 0) {
+                info.isGlobal = 0; info.slot = bg->funcTemps[ftIdx].slots[i]; info.size = 1;
                 return info;
             }
         }
-        if (ft->count >= ft->capacity) {
-            ft->capacity *= 2;
-            ft->items = (TempSlot*)xrealloc(ft->items, sizeof(TempSlot) * (size_t)ft->capacity);
+        if (bg->funcTemps[ftIdx].count >= bg->funcTemps[ftIdx].capacity) {
+            bg->funcTemps[ftIdx].capacity = bg->funcTemps[ftIdx].capacity ? bg->funcTemps[ftIdx].capacity * 2 : 16;
+            bg->funcTemps[ftIdx].names = (char (*)[64])xrealloc(bg->funcTemps[ftIdx].names, sizeof(char[64]) * (size_t)bg->funcTemps[ftIdx].capacity);
+            bg->funcTemps[ftIdx].slots = (int *)xrealloc(bg->funcTemps[ftIdx].slots, sizeof(int) * (size_t)bg->funcTemps[ftIdx].capacity);
         }
-        TempSlot* ts = &ft->items[ft->count++];
-        snprintf(ts->name, sizeof(ts->name), "%s", place);
-        ts->name[sizeof(ts->name) - 1] = '\0';
-        ts->offset = bc->current_fdef->frame_size + (ft->count - 1);
-        info.is_global = 0;
-        info.slot = ts->offset;
-        info.size = 1;
+        int slot = f->frame_size + bg->funcTemps[ftIdx].count;
+        strncpy(bg->funcTemps[ftIdx].names[bg->funcTemps[ftIdx].count], place, 63);
+        bg->funcTemps[ftIdx].slots[bg->funcTemps[ftIdx].count] = slot;
+        bg->funcTemps[ftIdx].count++;
+        info.isGlobal = 0; info.slot = slot; info.size = 1;
         return info;
     }
-    info.is_global = 1;
-    info.slot = 0;
-    info.size = 1;
+    info.isGlobal = 1; info.slot = 0; info.size = 1;
     return info;
 }
 
-static void push_place(BC* bc, const char* place, int line) {
+static void push_place(BG *bg, const char *place, int line) {
     if (is_numeric_place(place)) {
-        emit_instr(bc, "PUSH", strtod(place, NULL), place, line);
+        emit_instr(bg, "PUSH", atof(place), place, line);
     } else if (strncmp(place, "\"str", 4) == 0) {
         char buf[32];
         size_t n = strlen(place);
         if (n > 5) {
-            snprintf(buf, sizeof(buf), "%s", place + 4);
+            strncpy(buf, place + 4, sizeof(buf) - 1);
             buf[sizeof(buf) - 1] = '\0';
-            char* end = strrchr(buf, '"');
+            char *end = strrchr(buf, '"');
             if (end) *end = '\0';
-        } else {
-            buf[0] = '0'; buf[1] = '\0';
-        }
-        emit_instr(bc, "PUSH_STR", (double)atoi(buf), place, line);
+        } else { buf[0] = '0'; buf[1] = '\0'; }
+        emit_instr(bg, "PUSH_STR", (double)atoi(buf), place, line);
     } else {
-        PlaceInfo info = place_info(bc, place);
-        BInstr* ins = emit_instr(bc, "LOAD", 0, place, line);
+        PlaceInfo info = place_info(bg, place);
+        BcInstr *ins = emit_instr(bg, "LOAD", 0, place, line);
         ins->slot = info.slot;
-        ins->is_global = info.is_global;
+        ins->isGlobal = info.isGlobal;
     }
 }
 
-static int array_size_of(BC* bc, const char* name) {
-    SymRec* g = sem_find_global(bc->sem, name);
+static int array_size_of(BG *bg, const char *name) {
+    SymRec *g = sem_find_global(bg->sem, name);
     if (g) return g->is_array ? g->size : -1;
-    if (bc->current_fdef) {
-        SymRec* r = reclist_find_pub(&bc->current_fdef->frame, name);
+    FuncDef *f = sem_find_function(bg->sem, bg->currentFunc);
+    if (f) {
+        SymRec *r = sem_find_in_frame(f, name);
         if (r) return r->is_array ? r->size : -1;
     }
     return -1;
 }
 
-static void add_fixup(BInstr* ins, const char* label) {
-    ins->has_fixup = 1;
-    snprintf(ins->target_label, sizeof(ins->target_label), "%s", label);
-}
-
-static int label_pc(BytecodeChunk* c, const char* name) {
-    for (int i = 0; i < c->label_count; i++) {
-        if (strcmp(c->labels[i].name, name) == 0) return c->labels[i].pc;
-    }
-    return -1;
-}
-
-static void store_result(BC* bc, const char* res, int line) {
-    PlaceInfo info = place_info(bc, res);
-    BInstr* ins = emit_instr(bc, "STORE", 0, res, line);
+static void store_result(BG *bg, const char *res, int line) {
+    PlaceInfo info = place_info(bg, res);
+    BcInstr *ins = emit_instr(bg, "STORE", 0, res, line);
     ins->slot = info.slot;
-    ins->is_global = info.is_global;
+    ins->isGlobal = info.isGlobal;
 }
 
-BytecodeChunk* generate_bytecode(const TACList* opt_tac, SemModel* sem,
-                                 const TempTypeList* temp_types, const StrList* strings,
-                                 DiagList* diags) {
-    BC bc;
-    memset(&bc, 0, sizeof(BC));
-    bc.sem = sem;
-    bc.temp_types = temp_types;
-    bc.diags = diags;
+static void add_fixup(BG *bg, int index, const char *label) {
+    if (bg->fixup_count >= bg->fixup_capacity) {
+        bg->fixup_capacity = bg->fixup_capacity ? bg->fixup_capacity * 2 : 64;
+        bg->fixups = xrealloc(bg->fixups, sizeof(*bg->fixups) * (size_t)bg->fixup_capacity);
+    }
+    bg->fixups[bg->fixup_count].index = index;
+    strncpy(bg->fixups[bg->fixup_count].label, label, 63);
+    bg->fixups[bg->fixup_count].label[63] = '\0';
+    bg->fixup_count++;
+}
 
-    BytecodeChunk* c = (BytecodeChunk*)xcalloc(1, sizeof(BytecodeChunk));
-    c->capacity = 256;
-    c->code = (BInstr*)xmalloc(sizeof(BInstr) * (size_t)c->capacity);
-    c->strings = strings;
-    c->func_cap = 8;
-    c->funcs = (FuncEntry*)xmalloc(sizeof(FuncEntry) * (size_t)c->func_cap);
-    c->label_cap = 64;
-    c->labels = (LabelEntry*)xmalloc(sizeof(LabelEntry) * (size_t)c->label_cap);
-    c->tbf_cap = 8;
-    c->temps_by_func = (TempsEntry*)xmalloc(sizeof(TempsEntry) * (size_t)c->tbf_cap);
-    bc.chunk = c;
+static const char *temp_type_of(TacResult *tac, const char *name) {
+    for (int i = 0; i < tac->tempType_count; i++) {
+        if (strcmp(tac->tempNames[i], name) == 0) return tac->tempTypes[i];
+    }
+    return NULL;
+}
 
-    for (int i = 0; i < opt_tac->count; i++) {
-        const TACInstr* ins = &opt_tac->items[i];
-        const char* op = ins->op;
+BcResult *nova_gen_bytecode(TacResult *tac, SemResult *sem) {
+    BG bg; memset(&bg, 0, sizeof(bg));
+    bg.r = (BcResult *)xcalloc(1, sizeof(BcResult));
+    bg.sem = sem;
+    bg.r->strings = tac->strings;
+    bg.r->string_count = tac->string_count;
 
-        if (strcmp(op, "FUNC_BEGIN") == 0) {
-            snprintf(bc.current_func, sizeof(bc.current_func), "%s", ins->res);
-            bc.current_func[sizeof(bc.current_func) - 1] = '\0';
-            bc.current_fdef = sem_get_function(sem, bc.current_func);
-            if (c->func_count >= c->func_cap) {
-                c->func_cap *= 2;
-                c->funcs = (FuncEntry*)xrealloc(c->funcs, sizeof(FuncEntry) * (size_t)c->func_cap);
+    for (int idx = 0; idx < tac->count; idx++) {
+        TacInstr *ins = &tac->items[idx];
+        if (strcmp(ins->op, "FUNC_BEGIN") == 0) {
+            strncpy(bg.currentFunc, ins->res, sizeof(bg.currentFunc) - 1);
+            /* funcPC */
+            if (bg.r->func_count >= bg.r->func_capacity) {
+                bg.r->func_capacity = bg.r->func_capacity ? bg.r->func_capacity * 2 : 16;
+                bg.r->funcNames = (char (*)[256])xrealloc(bg.r->funcNames, sizeof(char[256]) * (size_t)bg.r->func_capacity);
+                bg.r->funcPCs = (int *)xrealloc(bg.r->funcPCs, sizeof(int) * (size_t)bg.r->func_capacity);
             }
-            snprintf(c->funcs[c->func_count].name, sizeof(c->funcs[0].name), "%s", ins->res);
-            c->funcs[c->func_count].pc = c->count;
-            c->func_count++;
-        } else if (strcmp(op, "FUNC_END") == 0) {
-            FuncTemps* ft = ftemps_for(&bc.ftemps, ins->res);
-            if (c->tbf_count >= c->tbf_cap) {
-                c->tbf_cap *= 2;
-                c->temps_by_func = (TempsEntry*)xrealloc(c->temps_by_func, sizeof(TempsEntry) * (size_t)c->tbf_cap);
+            strncpy(bg.r->funcNames[bg.r->func_count], ins->res, 255);
+            bg.r->funcPCs[bg.r->func_count] = bg.r->count;
+            bg.r->func_count++;
+        } else if (strcmp(ins->op, "FUNC_END") == 0) {
+            /* tempsByFunc */
+            int cnt = 0;
+            for (int i = 0; i < bg.funcTemp_count; i++) {
+                if (strcmp(bg.funcTemps[i].func, bg.currentFunc) == 0) { cnt = bg.funcTemps[i].count; break; }
             }
-            snprintf(c->temps_by_func[c->tbf_count].name, sizeof(c->temps_by_func[0].name), "%s", ins->res);
-            c->temps_by_func[c->tbf_count].temps = ft->count;
-            c->tbf_count++;
-            bc.current_func[0] = '\0';
-            bc.current_fdef = NULL;
-        } else if (strcmp(op, "LABEL") == 0) {
-            if (c->label_count >= c->label_cap) {
-                c->label_cap *= 2;
-                c->labels = (LabelEntry*)xrealloc(c->labels, sizeof(LabelEntry) * (size_t)c->label_cap);
+            if (bg.r->tbf_count >= bg.r->tbf_capacity) {
+                bg.r->tbf_capacity = bg.r->tbf_capacity ? bg.r->tbf_capacity * 2 : 16;
+                bg.r->tbfNames = (char (*)[256])xrealloc(bg.r->tbfNames, sizeof(char[256]) * (size_t)bg.r->tbf_capacity);
+                bg.r->tbfTemps = (int *)xrealloc(bg.r->tbfTemps, sizeof(int) * (size_t)bg.r->tbf_capacity);
             }
-            snprintf(c->labels[c->label_count].name, sizeof(c->labels[0].name), "%s", ins->res);
-            c->labels[c->label_count].pc = c->count;
-            c->label_count++;
-        } else if (strcmp(op, "GOTO") == 0) {
-            BInstr* b = emit_instr(&bc, "JMP", 0, ins->res, ins->line);
-            add_fixup(b, ins->res);
-        } else if (strcmp(op, "IF_FALSE") == 0) {
-            push_place(&bc, ins->a1, ins->line);
-            BInstr* b = emit_instr(&bc, "JZ", 0, ins->res, ins->line);
-            add_fixup(b, ins->res);
-        } else if (strcmp(op, "=") == 0) {
-            push_place(&bc, ins->a1, ins->line);
-            store_result(&bc, ins->res, ins->line);
-        } else if (strcmp(op, "+") == 0 || strcmp(op, "-") == 0 || strcmp(op, "*") == 0 ||
-                   strcmp(op, "/") == 0 || strcmp(op, "%") == 0 || strcmp(op, "==") == 0 ||
-                   strcmp(op, "!=") == 0 || strcmp(op, "<") == 0 || strcmp(op, ">") == 0 ||
-                   strcmp(op, "<=") == 0 || strcmp(op, ">=") == 0 || strcmp(op, "&&") == 0 ||
-                   strcmp(op, "||") == 0) {
-            push_place(&bc, ins->a1, ins->line);
-            push_place(&bc, ins->a2, ins->line);
-            const char* bop = "ADD";
-            if (strcmp(op, "+") == 0) bop = "ADD";
-            else if (strcmp(op, "-") == 0) bop = "SUB";
-            else if (strcmp(op, "*") == 0) bop = "MUL";
-            else if (strcmp(op, "%") == 0) bop = "MOD";
-            else if (strcmp(op, "==") == 0) bop = "EQ";
-            else if (strcmp(op, "!=") == 0) bop = "NEQ";
-            else if (strcmp(op, "<") == 0) bop = "LT";
-            else if (strcmp(op, ">") == 0) bop = "GT";
-            else if (strcmp(op, "<=") == 0) bop = "LEQ";
-            else if (strcmp(op, ">=") == 0) bop = "GEQ";
-            else if (strcmp(op, "&&") == 0) bop = "AND";
-            else if (strcmp(op, "||") == 0) bop = "OR";
-            if (strcmp(op, "/") == 0) {
-                const char* lt = temp_type_of(temp_types, ins->a1);
-                const char* rt = temp_type_of(temp_types, ins->a2);
-                int floaty = is_float_literal_place(ins->a1) || is_float_literal_place(ins->a2) ||
-                             (lt && strcmp(lt, "double") == 0) || (rt && strcmp(rt, "double") == 0);
-                bop = floaty ? "DIVF" : "DIV";
+            strncpy(bg.r->tbfNames[bg.r->tbf_count], bg.currentFunc, 255);
+            bg.r->tbfTemps[bg.r->tbf_count] = cnt;
+            bg.r->tbf_count++;
+            bg.currentFunc[0] = '\0';
+        } else if (strcmp(ins->op, "LABEL") == 0) {
+            if (bg.label_count >= bg.label_capacity) {
+                bg.label_capacity = bg.label_capacity ? bg.label_capacity * 2 : 64;
+                bg.labelNames = (char (*)[64])xrealloc(bg.labelNames, sizeof(char[64]) * (size_t)bg.label_capacity);
+                bg.labelPCs = (int *)xrealloc(bg.labelPCs, sizeof(int) * (size_t)bg.label_capacity);
             }
-            emit_instr(&bc, bop, 0, ins->res, ins->line);
-            store_result(&bc, ins->res, ins->line);
-        } else if (strcmp(op, "neg") == 0) {
-            push_place(&bc, ins->a1, ins->line);
-            emit_instr(&bc, "NEG", 0, ins->res, ins->line);
-            store_result(&bc, ins->res, ins->line);
-        } else if (strcmp(op, "!") == 0) {
-            push_place(&bc, ins->a1, ins->line);
-            emit_instr(&bc, "NOT", 0, ins->res, ins->line);
-            store_result(&bc, ins->res, ins->line);
-        } else if (strcmp(op, "ADDR") == 0) {
-            PlaceInfo info = place_info(&bc, ins->a1);
+            strncpy(bg.labelNames[bg.label_count], ins->res, 63);
+            bg.labelNames[bg.label_count][63] = '\0';
+            bg.labelPCs[bg.label_count] = bg.r->count;
+            bg.label_count++;
+        } else if (strcmp(ins->op, "GOTO") == 0) {
+            BcInstr *i = emit_instr(&bg, "JMP", 0, ins->res, ins->line);
+            add_fixup(&bg, i->pc, ins->res);
+        } else if (strcmp(ins->op, "IF_FALSE") == 0) {
+            push_place(&bg, ins->a1, ins->line);
+            BcInstr *i = emit_instr(&bg, "JZ", 0, ins->res, ins->line);
+            add_fixup(&bg, i->pc, ins->res);
+        } else if (strcmp(ins->op, "=") == 0) {
+            push_place(&bg, ins->a1, ins->line);
+            store_result(&bg, ins->res, ins->line);
+        } else if (strcmp(ins->op, "+") == 0 || strcmp(ins->op, "-") == 0 || strcmp(ins->op, "*") == 0 ||
+                   strcmp(ins->op, "/") == 0 || strcmp(ins->op, "%") == 0 ||
+                   strcmp(ins->op, "==") == 0 || strcmp(ins->op, "!=") == 0 ||
+                   strcmp(ins->op, "<") == 0 || strcmp(ins->op, ">") == 0 ||
+                   strcmp(ins->op, "<=") == 0 || strcmp(ins->op, ">=") == 0 ||
+                   strcmp(ins->op, "&&") == 0 || strcmp(ins->op, "||") == 0 ||
+                   strcmp(ins->op, "&") == 0 || strcmp(ins->op, "|") == 0 ||
+                   strcmp(ins->op, "^") == 0 || strcmp(ins->op, "<<") == 0 || strcmp(ins->op, ">>") == 0) {
+            push_place(&bg, ins->a1, ins->line);
+            push_place(&bg, ins->a2, ins->line);
+            const char *op = NULL;
+            if (strcmp(ins->op, "+") == 0) op = "ADD";
+            else if (strcmp(ins->op, "-") == 0) op = "SUB";
+            else if (strcmp(ins->op, "*") == 0) op = "MUL";
+            else if (strcmp(ins->op, "%") == 0) op = "MOD";
+            else if (strcmp(ins->op, "==") == 0) op = "EQ";
+            else if (strcmp(ins->op, "!=") == 0) op = "NEQ";
+            else if (strcmp(ins->op, "<") == 0) op = "LT";
+            else if (strcmp(ins->op, ">") == 0) op = "GT";
+            else if (strcmp(ins->op, "<=") == 0) op = "LEQ";
+            else if (strcmp(ins->op, ">=") == 0) op = "GEQ";
+            else if (strcmp(ins->op, "&&") == 0) op = "AND";
+            else if (strcmp(ins->op, "||") == 0) op = "OR";
+            else if (strcmp(ins->op, "&") == 0) op = "BAND";
+            else if (strcmp(ins->op, "|") == 0) op = "BOR";
+            else if (strcmp(ins->op, "^") == 0) op = "BXOR";
+            else if (strcmp(ins->op, "<<") == 0) op = "SHL";
+            else if (strcmp(ins->op, ">>") == 0) op = "SHR";
+            if (strcmp(ins->op, "/") == 0) {
+                const char *lt = temp_type_of(tac, ins->a1);
+                const char *rt = temp_type_of(tac, ins->a2);
+                int floaty1 = 0, floaty2 = 0;
+                /* numeric literal with '.' counts as float */
+                const char *a1 = ins->a1, *a2 = ins->a2;
+                if (strchr(a1, '.')) floaty1 = 1;
+                if (strchr(a2, '.')) floaty2 = 1;
+                if (lt && strcmp(lt, "double") == 0) floaty1 = 1;
+                if (rt && strcmp(rt, "double") == 0) floaty2 = 1;
+                op = (floaty1 || floaty2) ? "DIVF" : "DIV";
+            }
+            emit_instr(&bg, op, 0, ins->res, ins->line);
+            store_result(&bg, ins->res, ins->line);
+        } else if (strcmp(ins->op, "neg") == 0) {
+            push_place(&bg, ins->a1, ins->line);
+            emit_instr(&bg, "NEG", 0, ins->res, ins->line);
+            store_result(&bg, ins->res, ins->line);
+        } else if (strcmp(ins->op, "!") == 0) {
+            push_place(&bg, ins->a1, ins->line);
+            emit_instr(&bg, "NOT", 0, ins->res, ins->line);
+            store_result(&bg, ins->res, ins->line);
+        } else if (strcmp(ins->op, "~") == 0) {
+            push_place(&bg, ins->a1, ins->line);
+            emit_instr(&bg, "BNOT", 0, ins->res, ins->line);
+            store_result(&bg, ins->res, ins->line);
+        } else if (strcmp(ins->op, "CAST_I") == 0) {
+            push_place(&bg, ins->a1, ins->line);
+            emit_instr(&bg, "CVT_I", 0, ins->res, ins->line);
+            store_result(&bg, ins->res, ins->line);
+        } else if (strcmp(ins->op, "CAST_F") == 0) {
+            push_place(&bg, ins->a1, ins->line);
+            emit_instr(&bg, "CVT_F", 0, ins->res, ins->line);
+            store_result(&bg, ins->res, ins->line);
+        } else if (strcmp(ins->op, "ADDR") == 0) {
+            PlaceInfo info = place_info(&bg, ins->a1);
             long long off = 0;
             if (ins->a2[0]) off = strtoll(ins->a2, NULL, 10);
-            BInstr* b = emit_instr(&bc, "ADDR", (double)off, ins->a1, ins->line);
-            b->slot = info.slot;
-            b->is_global = info.is_global;
-            store_result(&bc, ins->res, ins->line);
-        } else if (strcmp(op, "IDX_ADDR") == 0) {
-            PlaceInfo info = place_info(&bc, ins->a1);
-            push_place(&bc, ins->a2, ins->line); /* index */
-            BInstr* b = emit_instr(&bc, "IDX_ADDR", (double)array_size_of(&bc, ins->a1), ins->a1, ins->line);
-            b->slot = info.slot;
-            b->is_global = info.is_global;
-            b->array_size = array_size_of(&bc, ins->a1);
-            store_result(&bc, ins->res, ins->line);
-        } else if (strcmp(op, "LOAD_PTR") == 0) {
-            push_place(&bc, ins->a1, ins->line);
-            emit_instr(&bc, "LOAD_AT", 0, ins->res, ins->line);
-            store_result(&bc, ins->res, ins->line);
-        } else if (strcmp(op, "STORE_PTR") == 0) {
-            /* a1 = address place, a2 = value place */
-            push_place(&bc, ins->a2, ins->line);
-            push_place(&bc, ins->a1, ins->line);
-            emit_instr(&bc, "STORE_AT", 0, ins->a1, ins->line);
-        } else if (strcmp(op, "PARAM") == 0) {
-            push_place(&bc, ins->a1, ins->line);
-        } else if (strcmp(op, "CALL") == 0) {
-            BInstr* b = emit_instr(&bc, "CALL", (double)atoi(ins->a2), ins->a1, ins->line);
-            (void)b;
-            store_result(&bc, ins->res, ins->line);
-        } else if (strcmp(op, "PRINT") == 0) {
+            BcInstr *i = emit_instr(&bg, "ADDR", (double)off, ins->a1, ins->line);
+            i->slot = info.slot;
+            i->isGlobal = info.isGlobal;
+            store_result(&bg, ins->res, ins->line);
+        } else if (strcmp(ins->op, "IDX_ADDR") == 0) {
+            PlaceInfo info = place_info(&bg, ins->a1);
+            push_place(&bg, ins->a2, ins->line);
+            BcInstr *i = emit_instr(&bg, "IDX_ADDR", (double)array_size_of(&bg, ins->a1), ins->a1, ins->line);
+            i->slot = info.slot;
+            i->isGlobal = info.isGlobal;
+            store_result(&bg, ins->res, ins->line);
+        } else if (strcmp(ins->op, "LOAD_PTR") == 0) {
+            push_place(&bg, ins->a1, ins->line);
+            emit_instr(&bg, "LOAD_AT", 0, ins->res, ins->line);
+            store_result(&bg, ins->res, ins->line);
+        } else if (strcmp(ins->op, "STORE_PTR") == 0) {
+            push_place(&bg, ins->a2, ins->line); /* value */
+            push_place(&bg, ins->a1, ins->line); /* address */
+            emit_instr(&bg, "STORE_AT", 0, ins->a1, ins->line);
+        } else if (strcmp(ins->op, "PARAM") == 0) {
+            push_place(&bg, ins->a1, ins->line);
+        } else if (strcmp(ins->op, "CALL") == 0) {
+            emit_instr(&bg, "CALL", (double)atoi(ins->a2), ins->a1, ins->line);
+            store_result(&bg, ins->res, ins->line);
+        } else if (strcmp(ins->op, "PRINT") == 0) {
             char buf[32];
             size_t n = strlen(ins->a1);
-            snprintf(buf, sizeof(buf), "%s", n > 4 ? ins->a1 + 4 : "0");
-            buf[sizeof(buf) - 1] = '\0';
-            char* end = strrchr(buf, '"');
-            if (end) *end = '\0';
-            BInstr* b = emit_instr(&bc, "PRINT", (double)atoi(ins->a2), ins->a1, ins->line);
-            b->fmt_idx = atoi(buf);
-        } else if (strcmp(op, "READ") == 0) {
+            if (n > 5) {
+                strncpy(buf, ins->a1 + 4, sizeof(buf) - 1);
+                buf[sizeof(buf) - 1] = '\0';
+                char *end = strrchr(buf, '"');
+                if (end) *end = '\0';
+            } else { buf[0] = '0'; buf[1] = '\0'; }
+            BcInstr *i = emit_instr(&bg, "PRINT", (double)atoi(ins->a2), ins->a1, ins->line);
+            i->fmtIdx = atoi(buf);
+        } else if (strcmp(ins->op, "READ") == 0) {
             char buf[32];
             size_t n = strlen(ins->a1);
-            snprintf(buf, sizeof(buf), "%s", n > 4 ? ins->a1 + 4 : "0");
-            buf[sizeof(buf) - 1] = '\0';
-            char* end = strrchr(buf, '"');
-            if (end) *end = '\0';
-            BInstr* b = emit_instr(&bc, "INPUT", (double)atoi(ins->a2), ins->a1, ins->line);
-            b->fmt_idx = atoi(buf);
-        } else if (strcmp(op, "RETURN") == 0) {
-            int has_val = ins->a1[0] != '\0';
-            if (has_val) push_place(&bc, ins->a1, ins->line);
-            emit_instr(&bc, "RET", has_val ? 1.0 : 0.0, "", ins->line);
+            if (n > 5) {
+                strncpy(buf, ins->a1 + 4, sizeof(buf) - 1);
+                buf[sizeof(buf) - 1] = '\0';
+                char *end = strrchr(buf, '"');
+                if (end) *end = '\0';
+            } else { buf[0] = '0'; buf[1] = '\0'; }
+            BcInstr *i = emit_instr(&bg, "INPUT", (double)atoi(ins->a2), ins->a1, ins->line);
+            i->fmtIdx = atoi(buf);
+        } else if (strcmp(ins->op, "RETURN") == 0) {
+            int hasVal = (ins->a1[0] != '\0');
+            if (hasVal) push_place(&bg, ins->a1, ins->line);
+            emit_instr(&bg, "RET", hasVal ? 1 : 0, "", ins->line);
         }
     }
 
-    emit_instr(&bc, "HALT", 0, "", 0);
+    emit_instr(&bg, "HALT", 0, "", 0);
 
-    /* fixups */
-    for (int i = 0; i < c->count; i++) {
-        BInstr* ins = &c->code[i];
-        if (ins->has_fixup) {
-            int target = label_pc(c, ins->target_label);
-            ins->operand = target >= 0 ? target : c->count - 1;
+    /* resolve fixups */
+    for (int f = 0; f < bg.fixup_count; f++) {
+        int target = -1;
+        for (int l = 0; l < bg.label_count; l++) {
+            if (strcmp(bg.labelNames[l], bg.fixups[f].label) == 0) { target = bg.labelPCs[l]; break; }
         }
+        bg.r->items[bg.fixups[f].index].operand = (target >= 0) ? target : bg.r->count - 1;
     }
 
-    /* free temp-slot maps */
-    for (int i = 0; i < bc.ftemps.count; i++) free(bc.ftemps.items[i].items);
-    free(bc.ftemps.items);
+    /* free temporaries */
+    free(bg.labelNames); free(bg.labelPCs);
+    free(bg.fixups);
+    for (int i = 0; i < bg.funcTemp_count; i++) { free(bg.funcTemps[i].names); free(bg.funcTemps[i].slots); }
+    free(bg.funcTemps);
 
-    return c;
+    return bg.r;
 }
 
-int chunk_func_pc(const BytecodeChunk* chunk, const char* name) {
-    for (int i = 0; i < chunk->func_count; i++) {
-        if (strcmp(chunk->funcs[i].name, name) == 0) return chunk->funcs[i].pc;
-    }
+int bc_func_pc(BcResult *b, const char *name) {
+    for (int i = 0; i < b->func_count; i++) if (strcmp(b->funcNames[i], name) == 0) return b->funcPCs[i];
     return -1;
 }
-
-int chunk_temps_for(const BytecodeChunk* chunk, const char* name) {
-    for (int i = 0; i < chunk->tbf_count; i++) {
-        if (strcmp(chunk->temps_by_func[i].name, name) == 0) return chunk->temps_by_func[i].temps;
-    }
+int bc_temps_for(BcResult *b, const char *name) {
+    for (int i = 0; i < b->tbf_count; i++) if (strcmp(b->tbfNames[i], name) == 0) return b->tbfTemps[i];
     return 0;
 }
 
-void bytecode_chunk_free(BytecodeChunk* chunk) {
-    if (!chunk) return;
-    free(chunk->code);
-    free(chunk->funcs);
-    free(chunk->labels);
-    free(chunk->temps_by_func);
-    free(chunk);
+void nova_bytecode_free(BcResult *b) {
+    if (!b) return;
+    free(b->items);
+    free(b->funcNames); free(b->funcPCs);
+    free(b->tbfNames); free(b->tbfTemps);
+    free(b);
 }

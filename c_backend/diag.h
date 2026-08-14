@@ -11,10 +11,14 @@ typedef struct {
     char msg[256];
 } Diag;
 
+/* Mirrors DIAGNOSTIC_LIMIT in src/engine/compilerEngine.js. */
+#define NOVA_DIAGNOSTIC_LIMIT 100
+
 typedef struct {
     Diag* items;
     int count;
     int capacity;
+    int limit_note_added;
 } DiagList;
 
 DiagList* diag_list_new(void);

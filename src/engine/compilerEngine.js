@@ -58,23 +58,203 @@ function truncateToInteger(v) {
 }
 
 // ---------------------------------------------------------------------------
+// Predefined macros & constants (identical in the JS and C engines)
+// ---------------------------------------------------------------------------
+
+// Object-like macros usable in #if/#ifdef and as values.
+const PREDEFINED_MACROS = {
+  '__STDC__': { kind: 'int', value: 1 },
+  '__STDC_VERSION__': { kind: 'int', value: 199901 },
+  '__STDC_HOSTED__': { kind: 'int', value: 1 },
+  '__STDC_NO_ATOMICS__': { kind: 'int', value: 1 },
+  '__NOVA__': { kind: 'int', value: 1 },
+  '__VERSION__': { kind: 'string', value: 'NOVA 2.0' },
+  '__FILE__': { kind: 'string', value: 'main.c' },
+  'NULL': { kind: 'int', value: 0 },
+  'M_PI': { kind: 'float', value: 3.141592653589793 },
+  'M_E': { kind: 'float', value: 2.718281828459045 }
+};
+
+const DIAGNOSTIC_LIMIT = 100;
+
+// ---------------------------------------------------------------------------
 // Diagnostics
 // ---------------------------------------------------------------------------
 
 class DiagList {
-  constructor() { this.items = []; }
-  add(level, line, column, msg) { this.items.push({ level, msg, line, column }); }
+  constructor() { this.items = []; this.limitNoteAdded = false; }
+  add(level, line, column, msg) {
+    if (this.items.length >= DIAGNOSTIC_LIMIT) {
+      if (!this.limitNoteAdded) {
+        this.limitNoteAdded = true;
+        this.items.push({
+          level: 'warning', line: 0, column: 0,
+          msg: `Diagnostic limit (${DIAGNOSTIC_LIMIT}) reached — further diagnostics suppressed. ` +
+               'The program likely uses constructs outside the NOVA C subset.'
+        });
+      }
+      return;
+    }
+    this.items.push({ level, msg, line, column });
+  }
   hasErrors() { return this.items.some((d) => d.level === 'error'); }
 }
 
 // ---------------------------------------------------------------------------
-// Phase 1: Lexer
+// Phase 0/1: Preprocessor conditionals + Lexer
 // ---------------------------------------------------------------------------
+
+// Minimal #if expression evaluator: defined(X), defined X, integer literals,
+// identifiers (0), ! && || ( ) and comparison operators. Deterministic.
+function evalPreprocExpr(text) {
+  let i = 0;
+  const n = text.length;
+
+  const skipWs = () => { while (i < n && /\s/.test(text[i])) i++; };
+
+  function parsePrimary() {
+    skipWs();
+    if (i >= n) return 0;
+    if (text[i] === '(') {
+      i++;
+      const v = parseOr();
+      skipWs();
+      if (text[i] === ')') i++;
+      return v;
+    }
+    if (text[i] === '!') {
+      i++;
+      return parsePrimary() ? 0 : 1;
+    }
+    if (/[0-9]/.test(text[i])) {
+      let s = '';
+      if (text[i] === '0' && (text[i + 1] === 'x' || text[i + 1] === 'X')) {
+        s += text[i++]; s += text[i++];
+        while (i < n && /[0-9a-fA-F]/.test(text[i])) s += text[i++];
+        return parseInt(s, 16) || 0;
+      }
+      while (i < n && /[0-9]/.test(text[i])) s += text[i++];
+      if (i < n && (text[i] === 'L' || text[i] === 'l' || text[i] === 'U' || text[i] === 'u')) i++;
+      return parseInt(s, 10) || 0;
+    }
+    if (text.startsWith('defined', i) && (i + 7 >= n || !/[a-zA-Z0-9_]/.test(text[i + 7]))) {
+      i += 7;
+      skipWs();
+      let paren = false;
+      if (text[i] === '(') { paren = true; i++; }
+      skipWs();
+      let name = '';
+      while (i < n && /[a-zA-Z0-9_]/.test(text[i])) name += text[i++];
+      skipWs();
+      if (paren && text[i] === ')') i++;
+      return Object.prototype.hasOwnProperty.call(PREDEFINED_MACROS, name) ? 1 : 0;
+    }
+    if (/[a-zA-Z_]/.test(text[i])) {
+      let name = '';
+      while (i < n && /[a-zA-Z0-9_]/.test(text[i])) name += text[i++];
+      if (Object.prototype.hasOwnProperty.call(PREDEFINED_MACROS, name)) {
+        const m = PREDEFINED_MACROS[name];
+        return m.kind === 'int' ? m.value : 1;
+      }
+      return 0;
+    }
+    i++;
+    return 0;
+  }
+
+  function parseRel() {
+    let v = parsePrimary();
+    for (;;) {
+      skipWs();
+      const two = text.slice(i, i + 2);
+      const one = text[i];
+      let op = null;
+      if (two === '<=' || two === '>=' || two === '==' || two === '!=') { op = two; i += 2; }
+      else if (one === '<' || one === '>') { op = one; i += 1; }
+      else break;
+      const r = parsePrimary();
+      if (op === '<=') v = v <= r ? 1 : 0;
+      else if (op === '>=') v = v >= r ? 1 : 0;
+      else if (op === '==') v = v === r ? 1 : 0;
+      else if (op === '!=') v = v !== r ? 1 : 0;
+      else if (op === '<') v = v < r ? 1 : 0;
+      else v = v > r ? 1 : 0;
+    }
+    return v;
+  }
+
+  function parseAnd() {
+    let v = parseRel();
+    for (;;) {
+      skipWs();
+      if (text.startsWith('&&', i)) { i += 2; const r = parseRel(); v = (v && r) ? 1 : 0; }
+      else break;
+    }
+    return v;
+  }
+
+  function parseOr() {
+    let v = parseAnd();
+    for (;;) {
+      skipWs();
+      if (text.startsWith('||', i)) { i += 2; const r = parseAnd(); v = (v || r) ? 1 : 0; }
+      else break;
+    }
+    return v;
+  }
+
+  return parseOr() ? 1 : 0;
+}
 
 function tokenize(source, diags) {
   const tokens = [];
   let pos = 0, line = 1, col = 1;
   const n = source.length;
+
+  // Conditional-compilation stack: {active, everActive, parentActive}
+  const condStack = [];
+  const regionActive = () => condStack.every((e) => e.active);
+  const parentActive = () => condStack.length === 0 ? true : condStack[condStack.length - 1].active;
+
+  const handleConditional = (word, rest, l, c) => {
+    if (word === 'ifdef' || word === 'ifndef') {
+      const name = rest.trim().split(/\s+/)[0] || '';
+      const defined = Object.prototype.hasOwnProperty.call(PREDEFINED_MACROS, name);
+      const cond = word === 'ifdef' ? defined : !defined;
+      const parent = parentActive();
+      condStack.push({ active: parent && cond, everActive: parent && cond, parentActive: parent });
+    } else if (word === 'if') {
+      const parent = parentActive();
+      const cond = parent ? evalPreprocExpr(rest) !== 0 : false;
+      condStack.push({ active: cond, everActive: cond, parentActive: parent });
+    } else if (word === 'elif') {
+      if (condStack.length === 0) {
+        diags.add('error', l, c, '#elif without #if');
+        return;
+      }
+      const top = condStack[condStack.length - 1];
+      if (top.everActive || !top.parentActive) {
+        top.active = false;
+      } else {
+        top.active = evalPreprocExpr(rest) !== 0;
+        if (top.active) top.everActive = true;
+      }
+    } else if (word === 'else') {
+      if (condStack.length === 0) {
+        diags.add('error', l, c, '#else without #if');
+        return;
+      }
+      const top = condStack[condStack.length - 1];
+      top.active = top.parentActive && !top.everActive;
+      if (top.active) top.everActive = true;
+    } else if (word === 'endif') {
+      if (condStack.length === 0) {
+        diags.add('error', l, c, '#endif without #if');
+        return;
+      }
+      condStack.pop();
+    }
+  };
 
   const peek = (o = 0) => (pos + o < n ? source[pos + o] : '\0');
   const advance = () => {
@@ -88,6 +268,15 @@ function tokenize(source, diags) {
 
   while (pos < n) {
     const c = peek();
+
+    // Translation phase 2: backslash-newline line splicing
+    if (c === '\\' && (peek(1) === '\n' || (peek(1) === '\r' && peek(2) === '\n'))) {
+      advance(); // backslash (does not count as a line break)
+      if (peek() === '\r') advance();
+      // consume the newline without incrementing the logical line count
+      pos++;
+      continue;
+    }
 
     if (c === '\n' || c === ' ' || c === '\t' || c === '\r' || c === '\v' || c === '\f') {
       advance();
@@ -115,18 +304,69 @@ function tokenize(source, diags) {
     // Preprocessor directives
     if (c === '#') {
       advance();
-      let word = '#';
+      let word = '';
       while (pos < n && /[a-zA-Z]/.test(peek())) word += advance();
-      if (word === '#include') push('TOKEN_INCLUDE', word, startLine, startCol);
-      else if (word === '#define') push('TOKEN_DEFINE', word, startLine, startCol);
-      else push('TOKEN_HASH', word, startLine, startCol);
+
+      // conditional-compilation directives are handled by the lexer itself
+      if (word === 'ifdef' || word === 'ifndef' || word === 'if' ||
+          word === 'elif' || word === 'else' || word === 'endif') {
+        let rest = '';
+        while (pos < n && peek() !== '\n') rest += advance();
+        handleConditional(word, rest, startLine, startCol);
+        continue;
+      }
+
+      // other directives emit tokens; the parser skips to end of line.
+      // (Suppressed inside inactive conditional regions.)
+      if (!regionActive()) {
+        while (pos < n && peek() !== '\n') advance();
+        continue;
+      }
+      const full = '#' + word;
+      if (full === '#include') push('TOKEN_INCLUDE', full, startLine, startCol);
+      else if (full === '#define') push('TOKEN_DEFINE', full, startLine, startCol);
+      else push('TOKEN_HASH', full || '#', startLine, startCol);
       continue;
     }
 
-    // Identifiers / keywords
+    // Everything below is suppressed inside inactive conditional regions
+    if (!regionActive()) {
+      advance();
+      continue;
+    }
+
+    // Identifiers / keywords / predefined macros
     if (/[a-zA-Z_]/.test(c)) {
       let lex = '';
       while (pos < n && /[a-zA-Z0-9_]/.test(peek())) lex += advance();
+      // GNU-style attributes are ignored: __attribute__((...))
+      if (lex === '__attribute__') {
+        // skip balanced parentheses
+        if (peek() === '(') {
+          let depth = 0;
+          while (pos < n) {
+            const ch = peek();
+            if (ch === '(') depth++;
+            else if (ch === ')') { depth--; if (depth === 0) { advance(); break; } }
+            else if (ch === '\n') break;
+            advance();
+          }
+        }
+        continue;
+      }
+      if (Object.prototype.hasOwnProperty.call(PREDEFINED_MACROS, lex)) {
+        const m = PREDEFINED_MACROS[lex];
+        if (m.kind === 'int') {
+          push('TOKEN_INTEGER_LITERAL', String(m.value), startLine, startCol);
+        } else if (m.kind === 'float') {
+          push('TOKEN_FLOAT_LITERAL', String(m.value), startLine, startCol);
+        } else {
+          const t = { type: 'TOKEN_STRING_LITERAL', lexeme: `"${m.value}"`, line: startLine, column: startCol };
+          t.stringValue = m.value;
+          tokens.push(t);
+        }
+        continue;
+      }
       push(KEYWORDS[lex] || 'TOKEN_IDENTIFIER', lex, startLine, startCol);
       continue;
     }
@@ -138,6 +378,7 @@ function tokenize(source, diags) {
       if (c === '0' && (peek(1) === 'x' || peek(1) === 'X')) {
         lex += advance(); lex += advance();
         while (pos < n && /[0-9a-fA-F]/.test(peek())) lex += advance();
+        while (pos < n && /[fFlLuU]/.test(peek())) advance(); // suffixes (LL, ULL, ...)
         push('TOKEN_INTEGER_LITERAL', lex, startLine, startCol);
         continue;
       }
@@ -162,7 +403,8 @@ function tokenize(source, diags) {
           pos = save; line = saveL; col = saveC;
         }
       }
-      if (peek() === 'f' || peek() === 'F' || peek() === 'l' || peek() === 'L') advance(); // suffix
+      // suffixes: consume any combination of l/L/u/U/f/F (e.g. 0xFFLL, 3u)
+      while (pos < n && /[fFlLuU]/.test(peek())) advance();
       push(isFloat ? 'TOKEN_FLOAT_LITERAL' : 'TOKEN_INTEGER_LITERAL', lex, startLine, startCol);
       continue;
     }
@@ -225,14 +467,31 @@ function tokenize(source, diags) {
       continue;
     }
 
-    // Multi-character operators
+    // Ellipsis (variadic parameters) — must precede single-char '.' handling
+    if (c === '.' && peek(1) === '.' && peek(2) === '.') {
+      advance(); advance(); advance();
+      push('TOKEN_ELLIPSIS', '...', startLine, startCol);
+      continue;
+    }
+
+    // Multi-character operators (3-char first)
+    const three = c + peek(1) + peek(2);
+    const THREE_CHAR = {
+      '<<=': 'TOKEN_LSHIFT_ASSIGN', '>>=': 'TOKEN_RSHIFT_ASSIGN'
+    };
+    if (THREE_CHAR[three]) {
+      advance(); advance(); advance();
+      push(THREE_CHAR[three], three, startLine, startCol);
+      continue;
+    }
     const two = c + peek(1);
     const TWO_CHAR = {
       '++': 'TOKEN_PLUS_PLUS', '--': 'TOKEN_MINUS_MINUS', '==': 'TOKEN_EQ', '!=': 'TOKEN_NEQ',
       '<=': 'TOKEN_LEQ', '>=': 'TOKEN_GEQ', '&&': 'TOKEN_AND', '||': 'TOKEN_OR',
       '+=': 'TOKEN_PLUS_ASSIGN', '-=': 'TOKEN_MINUS_ASSIGN', '*=': 'TOKEN_STAR_ASSIGN',
       '/=': 'TOKEN_SLASH_ASSIGN', '%=': 'TOKEN_PERCENT_ASSIGN', '->': 'TOKEN_ARROW',
-      '<<': 'TOKEN_LSHIFT', '>>': 'TOKEN_RSHIFT'
+      '<<': 'TOKEN_LSHIFT', '>>': 'TOKEN_RSHIFT',
+      '&=': 'TOKEN_AND_ASSIGN', '|=': 'TOKEN_OR_ASSIGN', '^=': 'TOKEN_XOR_ASSIGN'
     };
     if (TWO_CHAR[two]) {
       advance(); advance();
@@ -258,6 +517,11 @@ function tokenize(source, diags) {
     advance();
     diags.add('error', startLine, startCol, `Unexpected character '${c}'`);
     push('TOKEN_ERROR', c, startLine, startCol);
+  }
+
+  while (condStack.length > 0) {
+    condStack.pop();
+    diags.add('error', line, col, 'Unterminated #if/#ifdef (missing #endif)');
   }
 
   push('TOKEN_EOF', 'EOF', line, col);
@@ -305,21 +569,37 @@ function parseProgram(tokens, diags) {
   function parseExpression() { return parseAssignment(); }
 
   function parseAssignment() {
-    const left = parseLogicalOr();
+    const cond = parseTernary();
     const t = peek();
     const ASSIGN_OPS = {
       TOKEN_ASSIGN: '=', TOKEN_PLUS_ASSIGN: '+=', TOKEN_MINUS_ASSIGN: '-=',
-      TOKEN_STAR_ASSIGN: '*=', TOKEN_SLASH_ASSIGN: '/=', TOKEN_PERCENT_ASSIGN: '%='
+      TOKEN_STAR_ASSIGN: '*=', TOKEN_SLASH_ASSIGN: '/=', TOKEN_PERCENT_ASSIGN: '%=',
+      TOKEN_AND_ASSIGN: '&=', TOKEN_OR_ASSIGN: '|=', TOKEN_XOR_ASSIGN: '^=',
+      TOKEN_LSHIFT_ASSIGN: '<<=', TOKEN_RSHIFT_ASSIGN: '>>='
     };
     if (ASSIGN_OPS[t.type]) {
       advanceTok();
       const right = parseAssignment(); // right-associative
       const node = makeNode(ASSIGN_OPS[t.type] === '=' ? 'NODE_ASSIGNMENT' : 'NODE_COMPOUND_ASSIGN', t.line);
       node.op = ASSIGN_OPS[t.type];
-      node.children.push(left, right);
+      node.children.push(cond, right);
       return node;
     }
-    return left;
+    return cond;
+  }
+
+  function parseTernary() {
+    const cond = parseLogicalOr();
+    if (peek().type === 'TOKEN_QUESTION') {
+      const t = advanceTok();
+      const node = makeNode('NODE_TERNARY', t.line);
+      node.children.push(cond);
+      node.children.push(parseAssignment());
+      expect('TOKEN_COLON', "':' in ternary expression");
+      node.children.push(parseTernary());
+      return node;
+    }
+    return cond;
   }
 
   function binaryLevel(next, ops) {
@@ -334,24 +614,187 @@ function parseProgram(tokens, diags) {
     return left;
   }
 
+  // C precedence: || < && < | < ^ < & < == < relational < shifts < additive < multiplicative
   const parseLogicalOr = () => binaryLevel(parseLogicalAnd, { TOKEN_OR: '||' });
-  const parseLogicalAnd = () => binaryLevel(parseEquality, { TOKEN_AND: '&&' });
+  const parseLogicalAnd = () => binaryLevel(parseBitOr, { TOKEN_AND: '&&' });
+  const parseBitOr = () => binaryLevel(parseBitXor, { TOKEN_BIT_OR: '|' });
+  const parseBitXor = () => binaryLevel(parseBitAnd, { TOKEN_BIT_XOR: '^' });
+  const parseBitAnd = () => binaryLevel(parseEquality, { TOKEN_AMPERSAND: '&' });
   const parseEquality = () => binaryLevel(parseRelational, { TOKEN_EQ: '==', TOKEN_NEQ: '!=' });
-  const parseRelational = () => binaryLevel(parseAdditive, { TOKEN_LT: '<', TOKEN_GT: '>', TOKEN_LEQ: '<=', TOKEN_GEQ: '>=' });
+  const parseRelational = () => binaryLevel(parseShift, { TOKEN_LT: '<', TOKEN_GT: '>', TOKEN_LEQ: '<=', TOKEN_GEQ: '>=' });
+  const parseShift = () => binaryLevel(parseAdditive, { TOKEN_LSHIFT: '<<', TOKEN_RSHIFT: '>>' });
   const parseAdditive = () => binaryLevel(parseMultiplicative, { TOKEN_PLUS: '+', TOKEN_MINUS: '-' });
   const parseMultiplicative = () => binaryLevel(parseUnary, { TOKEN_STAR: '*', TOKEN_SLASH: '/', TOKEN_PERCENT: '%' });
+
+  const CAST_STARTERS = new Set([
+    'TOKEN_INT', 'TOKEN_FLOAT', 'TOKEN_DOUBLE', 'TOKEN_CHAR', 'TOKEN_VOID',
+    'TOKEN_SHORT', 'TOKEN_LONG', 'TOKEN_UNSIGNED', 'TOKEN_SIGNED',
+    'TOKEN_CONST', 'TOKEN_VOLATILE', 'TOKEN_STRUCT'
+  ]);
+  const isTypeAhead = () => pos + 1 < tokens.length && CAST_STARTERS.has(tokens[pos + 1].type);
+
+  // Parses a type specifier: storage/qualifier keywords, length modifiers,
+  // base type or struct, plus pointer stars. Returns a normalized spec.
+  function parseTypeSpec() {
+    let isStatic = false, isExtern = false;
+    let baseType = null, baseTok = null;
+    let sawLong = 0, sawShort = false, sawUnsigned = false, sawSigned = false;
+
+    for (;;) {
+      const t = peek();
+      if (t.type === 'TOKEN_STATIC') { advanceTok(); isStatic = true; continue; }
+      if (t.type === 'TOKEN_EXTERN' || t.type === 'TOKEN_REGISTER') { advanceTok(); isExtern = true; continue; }
+      if (t.type === 'TOKEN_CONST' || t.type === 'TOKEN_VOLATILE') { advanceTok(); continue; }
+      if (t.type === 'TOKEN_IDENTIFIER' && t.lexeme === 'inline') { advanceTok(); continue; }
+      if (t.type === 'TOKEN_SIGNED') { advanceTok(); sawSigned = true; continue; }
+      if (t.type === 'TOKEN_UNSIGNED') { advanceTok(); sawUnsigned = true; continue; }
+      if (t.type === 'TOKEN_SHORT') { advanceTok(); sawShort = true; continue; }
+      if (t.type === 'TOKEN_LONG') { advanceTok(); sawLong++; continue; }
+      if (t.type === 'TOKEN_INT' || t.type === 'TOKEN_FLOAT' || t.type === 'TOKEN_DOUBLE' ||
+          t.type === 'TOKEN_CHAR' || t.type === 'TOKEN_VOID') {
+        baseTok = advanceTok();
+        baseType = { TOKEN_INT: 'int', TOKEN_FLOAT: 'float', TOKEN_DOUBLE: 'double',
+                     TOKEN_CHAR: 'char', TOKEN_VOID: 'void' }[baseTok.type];
+        continue; // allow `long long int`, `unsigned int`, ...
+      }
+      if (t.type === 'TOKEN_STRUCT' && !baseType) {
+        advanceTok();
+        const nameTok = expect('TOKEN_IDENTIFIER', 'struct name');
+        baseType = 'struct ' + (nameTok ? nameTok.lexeme : '<error>');
+        break;
+      }
+      break;
+    }
+
+    if (!baseType && (sawUnsigned || sawSigned || sawShort || sawLong)) baseType = 'int';
+
+    // normalize to the VM's two value kinds (int / double), keep 'void'
+    let normalized;
+    if (baseType === 'float' || baseType === 'double') normalized = 'double';
+    else if (baseType === 'void') normalized = 'void';
+    else if (baseType && baseType.startsWith('struct ')) normalized = baseType;
+    else normalized = 'int';
+
+    let ptr = 0;
+    while (check('TOKEN_STAR')) { advanceTok(); ptr++; }
+    let typeName = normalized + '*'.repeat(ptr);
+
+    return {
+      typeName, normalized, ptr, isStatic, isExtern,
+      baseKind: baseType || 'int',
+      sawLong, sawShort, sawUnsigned, sawSigned,
+      hasBase: !!baseType
+    };
+  }
+
+  function sizeOfTypeSpec(spec) {
+    if (spec.ptr > 0) return 8;
+    switch (spec.baseKind) {
+      case 'char': return 1;
+      case 'short': return 2;
+      case 'long': return spec.sawLong >= 2 ? 8 : 8;
+      case 'float': return 4;
+      case 'double': return 8;
+      case 'void': return 1;
+      default:
+        if (spec.baseKind && spec.baseKind.startsWith('struct ')) return 4;
+        return 4; /* int */
+    }
+  }
+
+  // true if the current token starts a declaration type specifier
+  // (storage class, qualifier, or length modifier — things isTypeToken misses)
+  function isDeclTypeStart() {
+    const t = peek();
+    if (t.type === 'TOKEN_STATIC' || t.type === 'TOKEN_EXTERN' || t.type === 'TOKEN_REGISTER' ||
+        t.type === 'TOKEN_CONST' || t.type === 'TOKEN_VOLATILE' ||
+        t.type === 'TOKEN_UNSIGNED' || t.type === 'TOKEN_SIGNED' ||
+        t.type === 'TOKEN_SHORT' || t.type === 'TOKEN_LONG') return true;
+    if (t.type === 'TOKEN_IDENTIFIER' && t.lexeme === 'inline') return true;
+    return false;
+  }
+
+  // Parse a local declaration whose type specifier was already consumed.
+  // Detects and cleanly rejects nested function definitions & function pointers.
+  function parseLocalDeclFromSpec(spec) {
+    const startTok = peek();
+    // Nested function definition:  int add(int a, int b) { ... }
+    if (check('TOKEN_IDENTIFIER') && tokens[pos + 1] && tokens[pos + 1].type === 'TOKEN_LPAREN') {
+      const afterParen = tokens[pos + 2];
+      // heuristic: a '(' followed by a type / ')' looks like a parameter list
+      if (afterParen && (CAST_STARTERS.has(afterParen.type) || afterParen.type === 'TOKEN_RPAREN' ||
+                          afterParen.type === 'TOKEN_ELLIPSIS')) {
+        diags.add('error', startTok.line, startTok.column,
+          'Nested function definitions are not supported in the NOVA C subset (they are a GNU C extension)');
+        skipDeclaration();
+        return makeNode('NODE_EMPTY', startTok.line);
+      }
+    }
+    // Function-pointer declarator:  int (*name)(...)
+    if (check('TOKEN_LPAREN') && tokens[pos + 1] && tokens[pos + 1].type === 'TOKEN_STAR') {
+      diags.add('error', peek().line, peek().column,
+        'Function pointers are not supported in the NOVA C subset');
+      skipDeclaration();
+      return makeNode('NODE_EMPTY', startTok.line);
+    }
+
+    const line = startTok.line;
+    const first = parseSingleDeclarator(spec.typeName, line, null);
+    if (spec.isStatic) first.is_static = true;
+    if (!check('TOKEN_COMMA')) {
+      expect('TOKEN_SEMICOLON', "';' after declaration");
+      return first;
+    }
+    const group = makeNode('NODE_DECL_LIST', line);
+    group.children.push(first);
+    while (match('TOKEN_COMMA')) {
+      const d = parseSingleDeclarator(spec.typeName, line, null);
+      if (spec.isStatic) d.is_static = true;
+      group.children.push(d);
+    }
+    expect('TOKEN_SEMICOLON', "';' after declaration");
+    return group;
+  }
+
+  function parseCast() {
+    const t = advanceTok(); // '('
+    const spec = parseTypeSpec();
+    expect('TOKEN_RPAREN', "')' after cast type");
+    const node = makeNode('NODE_CAST', t.line);
+    node.type_name = spec.typeName;
+    node.children.push(parseUnary());
+    return node;
+  }
+
+  function parseSizeof() {
+    const t = advanceTok(); // 'sizeof'
+    if (check('TOKEN_LPAREN') && isTypeAhead()) {
+      advanceTok(); // '('
+      const spec = parseTypeSpec();
+      expect('TOKEN_RPAREN', "')' after sizeof type");
+      const lit = makeNode('NODE_INT_LITERAL', t.line);
+      lit.num_val = sizeOfTypeSpec(spec);
+      return lit;
+    }
+    const node = makeNode('NODE_SIZEOF', t.line);
+    node.children.push(parseUnary());
+    return node;
+  }
 
   function parseUnary() {
     const t = peek();
     if (t.type === 'TOKEN_MINUS' || t.type === 'TOKEN_NOT' || t.type === 'TOKEN_STAR' ||
-        t.type === 'TOKEN_AMPERSAND' || t.type === 'TOKEN_PLUS_PLUS' || t.type === 'TOKEN_MINUS_MINUS') {
+        t.type === 'TOKEN_AMPERSAND' || t.type === 'TOKEN_PLUS_PLUS' || t.type === 'TOKEN_MINUS_MINUS' ||
+        t.type === 'TOKEN_BIT_NOT') {
       advanceTok();
       const node = makeNode('NODE_UNARY_OP', t.line);
       node.op = { TOKEN_MINUS: '-', TOKEN_NOT: '!', TOKEN_STAR: '*', TOKEN_AMPERSAND: '&',
-                  TOKEN_PLUS_PLUS: '++', TOKEN_MINUS_MINUS: '--' }[t.type];
+                  TOKEN_PLUS_PLUS: '++', TOKEN_MINUS_MINUS: '--', TOKEN_BIT_NOT: '~' }[t.type];
       node.children.push(parseUnary());
       return node;
     }
+    if (t.type === 'TOKEN_SIZEOF') return parseSizeof();
+    if (t.type === 'TOKEN_LPAREN' && isTypeAhead()) return parseCast();
     return parsePostfix();
   }
 
@@ -359,6 +802,22 @@ function parseProgram(tokens, diags) {
     let expr = parsePrimary();
     for (;;) {
       const t = peek();
+      if (t.type === 'TOKEN_LPAREN' && expr.type === 'NODE_IDENTIFIER' && expr.identifier === 'offsetof') {
+        // offsetof(type, member) is a libc macro we cannot evaluate — skip its
+        // balanced argument parentheses with one clear diagnostic.
+        diags.add('error', expr.line, 1, "'offsetof' is not supported in the NOVA C subset");
+        advanceTok(); // '('
+        let depth = 1;
+        while (!check('TOKEN_EOF') && depth > 0) {
+          if (check('TOKEN_LPAREN')) depth++;
+          else if (check('TOKEN_RPAREN')) depth--;
+          advanceTok();
+        }
+        const lit = makeNode('NODE_INT_LITERAL', expr.line);
+        lit.num_val = 0;
+        expr = lit;
+        continue;
+      }
       if (t.type === 'TOKEN_LPAREN') {
         advanceTok();
         const call = makeNode('NODE_FUNC_CALL', t.line);
@@ -419,9 +878,17 @@ function parseProgram(tokens, diags) {
       return node;
     }
     if (t.type === 'TOKEN_STRING_LITERAL') {
-      advanceTok();
+      const first = advanceTok();
+      let value = first.stringValue;
+      let lexeme = first.lexeme;
+      // C translation phase 6: adjacent string literal concatenation
+      while (check('TOKEN_STRING_LITERAL')) {
+        const nxt = advanceTok();
+        value += nxt.stringValue;
+        lexeme = lexeme.slice(0, -1) + nxt.lexeme.slice(1);
+      }
       const node = makeNode('NODE_STRING_LITERAL', t.line);
-      node.string_val = t.stringValue;
+      node.string_val = value;
       return node;
     }
     if (t.type === 'TOKEN_IDENTIFIER') {
@@ -495,8 +962,32 @@ function parseProgram(tokens, diags) {
     return group;
   }
 
-  function parseStatement(inLoop) {
-    const t = peek();
+  // Skip tokens until ';' at nesting depth 0 (consuming it), or until a
+  // top-level '}' — used for graceful recovery on unsupported declarations.
+  function skipDeclaration() {
+    let depth = 0;
+    while (!check('TOKEN_EOF')) {
+      const ty = peek().type;
+      if (ty === 'TOKEN_LPAREN' || ty === 'TOKEN_LBRACKET' || ty === 'TOKEN_LBRACE') { depth++; advanceTok(); continue; }
+      if (ty === 'TOKEN_RPAREN' || ty === 'TOKEN_RBRACKET') { if (depth > 0) depth--; advanceTok(); continue; }
+      if (ty === 'TOKEN_RBRACE') {
+        if (depth === 0) return; // leave the brace for the caller
+        depth--; advanceTok(); continue;
+      }
+      if (ty === 'TOKEN_SEMICOLON' && depth === 0) { advanceTok(); return; }
+      advanceTok();
+    }
+  }
+
+  function parseStatement(inLoop, inSwitch) {
+    let t = peek();
+
+    // preprocessor directives may appear inside bodies; skip the line
+    if (t.type === 'TOKEN_INCLUDE' || t.type === 'TOKEN_DEFINE' || t.type === 'TOKEN_HASH') {
+      const l = t.line;
+      while (!check('TOKEN_EOF') && peek().line === l) advanceTok();
+      return makeNode('NODE_EMPTY', t.line);
+    }
 
     if (t.type === 'TOKEN_IF') {
       advanceTok();
@@ -504,8 +995,8 @@ function parseProgram(tokens, diags) {
       expect('TOKEN_LPAREN', "'(' after 'if'");
       node.children.push(parseExpression());
       expect('TOKEN_RPAREN', "')' after condition");
-      node.children.push(parseStatement(inLoop));
-      if (match('TOKEN_ELSE')) node.children.push(parseStatement(inLoop));
+      node.children.push(parseStatement(inLoop, inSwitch));
+      if (match('TOKEN_ELSE')) node.children.push(parseStatement(inLoop, inSwitch));
       return node;
     }
     if (t.type === 'TOKEN_WHILE') {
@@ -514,7 +1005,73 @@ function parseProgram(tokens, diags) {
       expect('TOKEN_LPAREN', "'(' after 'while'");
       node.children.push(parseExpression());
       expect('TOKEN_RPAREN', "')' after condition");
-      node.children.push(parseStatement(true));
+      node.children.push(parseStatement(true, inSwitch));
+      return node;
+    }
+    if (t.type === 'TOKEN_DO') {
+      advanceTok();
+      const node = makeNode('NODE_DO_WHILE_STMT', t.line);
+      node.children.push(parseStatement(true, inSwitch));
+      expect('TOKEN_WHILE', "'while' after do-body");
+      expect('TOKEN_LPAREN', "'(' after 'while'");
+      node.children.push(parseExpression());
+      expect('TOKEN_RPAREN', "')' after do-while condition");
+      expect('TOKEN_SEMICOLON', "';' after do-while");
+      return node;
+    }
+    if (t.type === 'TOKEN_SWITCH') {
+      advanceTok();
+      const node = makeNode('NODE_SWITCH_STMT', t.line);
+      expect('TOKEN_LPAREN', "'(' after 'switch'");
+      node.children.push(parseExpression());
+      expect('TOKEN_RPAREN', "')' after switch expression");
+      expect('TOKEN_LBRACE', "'{' after switch expression");
+      while (!check('TOKEN_RBRACE') && !check('TOKEN_EOF')) {
+        if (check('TOKEN_CASE')) {
+          const ct = advanceTok();
+          const caseNode = makeNode('NODE_CASE', ct.line);
+          let sign = 1;
+          if (check('TOKEN_MINUS')) { advanceTok(); sign = -1; }
+          if (check('TOKEN_INTEGER_LITERAL') || check('TOKEN_CHAR_LITERAL')) {
+            const v = advanceTok();
+            caseNode.num_val = sign * (v.type === 'TOKEN_CHAR_LITERAL' ? v.charValue : parseInt(v.lexeme, 0));
+          } else {
+            diagCaseError(ct);
+          }
+          expect('TOKEN_COLON', "':' after case value");
+          while (!check('TOKEN_CASE') && !check('TOKEN_DEFAULT') &&
+                 !check('TOKEN_RBRACE') && !check('TOKEN_EOF')) {
+            caseNode.children.push(parseStatement(inLoop, true));
+          }
+          node.children.push(caseNode);
+        } else if (check('TOKEN_DEFAULT')) {
+          const dt = advanceTok();
+          const defNode = makeNode('NODE_DEFAULT', dt.line);
+          expect('TOKEN_COLON', "':' after 'default'");
+          while (!check('TOKEN_CASE') && !check('TOKEN_DEFAULT') &&
+                 !check('TOKEN_RBRACE') && !check('TOKEN_EOF')) {
+            defNode.children.push(parseStatement(inLoop, true));
+          }
+          node.children.push(defNode);
+        } else {
+          const tok = peek();
+          diags.add('error', tok.line, tok.column, `Expected 'case' or 'default' in switch but found '${tok.lexeme}'`);
+          advanceTok();
+        }
+      }
+      expect('TOKEN_RBRACE', "'}' to close switch");
+      return node;
+    }
+    function diagCaseError(ct) {
+      diags.add('error', ct.line, ct.column, 'Case value must be an integer constant in the NOVA subset');
+    }
+    if (t.type === 'TOKEN_GOTO') {
+      advanceTok();
+      const node = makeNode('NODE_GOTO', t.line);
+      const id = expect('TOKEN_IDENTIFIER', 'label name after goto');
+      node.identifier = id ? id.lexeme : '<error>';
+      node.has_identifier = true;
+      expect('TOKEN_SEMICOLON', "';' after goto");
       return node;
     }
     if (t.type === 'TOKEN_FOR') {
@@ -525,9 +1082,9 @@ function parseProgram(tokens, diags) {
       if (check('TOKEN_SEMICOLON')) {
         advanceTok();
         node.children.push(makeNode('NODE_EMPTY', t.line));
-      } else if (isTypeToken()) {
-        const typeTok = advanceTok();
-        node.children.push(parseVarDeclTail(TYPE_NAMES[typeTok.type], typeTok.line));
+      } else if (isTypeToken() || isDeclTypeStart()) {
+        const spec = parseTypeSpec();
+        node.children.push(parseVarDeclTail(spec.typeName, t.line));
       } else {
         const e = makeNode('NODE_EXPRESSION_STMT', t.line);
         e.children.push(parseExpression());
@@ -548,7 +1105,7 @@ function parseProgram(tokens, diags) {
         node.children.push(parseExpression());
       }
       expect('TOKEN_RPAREN', "')' after for-loop clauses");
-      node.children.push(parseStatement(true));
+      node.children.push(parseStatement(true, inSwitch));
       return node;
     }
     if (t.type === 'TOKEN_RETURN') {
@@ -572,17 +1129,57 @@ function parseProgram(tokens, diags) {
       advanceTok();
       const comp = makeNode('NODE_COMPOUND_STMT', t.line);
       while (!check('TOKEN_RBRACE') && !check('TOKEN_EOF')) {
-        comp.children.push(parseStatement(inLoop));
+        comp.children.push(parseStatement(inLoop, inSwitch));
       }
       expect('TOKEN_RBRACE', "'}' to close block");
       return comp;
     }
-    if (isTypeToken()) {
-      const typeTok = advanceTok();
-      return parseVarDeclTail(TYPE_NAMES[typeTok.type], typeTok.line);
+    // Label:  name: statement
+    if (t.type === 'TOKEN_IDENTIFIER' && tokens[pos + 1] && tokens[pos + 1].type === 'TOKEN_COLON') {
+      advanceTok();
+      const labelNode = makeNode('NODE_LABEL_STMT', t.line);
+      labelNode.identifier = t.lexeme;
+      advanceTok(); // ':'
+      labelNode.children.push(parseStatement(inLoop, inSwitch));
+      return labelNode;
+    }
+    // Local declaration starting with any type specifier / qualifier
+    if (isTypeToken() || isDeclTypeStart()) {
+      const spec = parseTypeSpec();
+      if (!spec.hasBase && !(spec.sawUnsigned || spec.sawSigned || spec.sawShort || spec.sawLong)) {
+        // only qualifiers seen (e.g. a stray 'const') — fall through to expr
+      } else if (check('TOKEN_IDENTIFIER') && tokens[pos + 1] && tokens[pos + 1].type === 'TOKEN_IDENTIFIER') {
+        // multi-word types we don't support: 'double complex z', etc.
+        diags.add('error', t.line, t.column,
+          `Unsupported type combination near '${peek().lexeme}' (e.g. complex numbers are not in the NOVA subset)`);
+        skipDeclaration();
+        return makeNode('NODE_EMPTY', t.line);
+      } else {
+        return parseLocalDeclFromSpec(spec);
+      }
+    }
+    if (t.type === 'TOKEN_UNION' || t.type === 'TOKEN_ENUM') {
+      diags.add('error', t.line, t.column, `'${t.lexeme}' is not supported in the NOVA C subset`);
+      skipDeclaration();
+      return makeNode('NODE_EMPTY', t.line);
+    }
+    // Unknown (typedef'd) type in a local declaration:  FILE *f;  va_list args;
+    if (t.type === 'TOKEN_IDENTIFIER' && tokens[pos + 1] &&
+        (tokens[pos + 1].type === 'TOKEN_IDENTIFIER' || tokens[pos + 1].type === 'TOKEN_STAR')) {
+      diags.add('error', t.line, t.column,
+        `Unknown type '${t.lexeme}' — typedef names are not supported in the NOVA C subset`);
+      skipDeclaration();
+      return makeNode('NODE_EMPTY', t.line);
     }
     if (t.type === 'TOKEN_STRUCT') {
-      // struct-typed local variable: struct Name x;
+      // local struct definition (unsupported) or struct-typed variable
+      if (tokens[pos + 1] && tokens[pos + 1].type === 'TOKEN_IDENTIFIER' &&
+          tokens[pos + 2] && tokens[pos + 2].type === 'TOKEN_LBRACE') {
+        diags.add('error', t.line, t.column,
+          'Local struct definitions are not supported in the NOVA C subset');
+        skipDeclaration();
+        return makeNode('NODE_EMPTY', t.line);
+      }
       advanceTok();
       const nameTok = expect('TOKEN_IDENTIFIER', 'struct name');
       return parseVarDeclTail(`struct ${nameTok ? nameTok.lexeme : '<error>'}`, t.line);
@@ -613,17 +1210,20 @@ function parseProgram(tokens, diags) {
       return;
     }
     for (;;) {
-      if (!isTypeToken()) {
+      if (check('TOKEN_ELLIPSIS')) {
+        const et = advanceTok();
+        diags.add('error', et.line, et.column,
+          'Variadic functions (...) are not supported in the NOVA C subset');
+        continue;
+      }
+      if (!isTypeToken() && !isDeclTypeStart()) {
         diags.add('error', peek().line, peek().column, `Expected parameter type but found '${peek().lexeme}'`);
         break;
       }
-      const typeTok = advanceTok();
-      let typeName = TYPE_NAMES[typeTok.type];
-      let isPointer = false;
-      while (check('TOKEN_STAR')) { advanceTok(); isPointer = true; }
+      const spec = parseTypeSpec();
       const id = expect('TOKEN_IDENTIFIER', 'parameter name');
-      const param = makeNode('NODE_PARAMETER', typeTok.line);
-      param.type_name = isPointer ? typeName + '*' : typeName;
+      const param = makeNode('NODE_PARAMETER', id ? id.line : func.line);
+      param.type_name = spec.typeName;
       param.identifier = id ? id.lexeme : '<error>';
       func.children.push(param);
       if (match('TOKEN_COMMA')) continue;
@@ -642,6 +1242,18 @@ function parseProgram(tokens, diags) {
       continue;
     }
 
+    if (t.type === 'TOKEN_TYPEDEF') {
+      advanceTok();
+      diags.add('error', t.line, t.column, 'typedef is not supported in the NOVA C subset');
+      skipDeclaration();
+      continue;
+    }
+    if (t.type === 'TOKEN_UNION' || t.type === 'TOKEN_ENUM') {
+      diags.add('error', t.line, t.column, `'${t.lexeme}' is not supported in the NOVA C subset`);
+      skipDeclaration();
+      continue;
+    }
+
     if (t.type === 'TOKEN_STRUCT') {
       advanceTok();
       const nameTok = expect('TOKEN_IDENTIFIER', 'struct name');
@@ -650,24 +1262,42 @@ function parseProgram(tokens, diags) {
         const def = makeNode('NODE_STRUCT_DEF', t.line);
         def.identifier = nameTok ? nameTok.lexeme : '<error>';
         while (!check('TOKEN_RBRACE') && !check('TOKEN_EOF')) {
-          if (!isTypeToken()) {
-            diags.add('error', peek().line, peek().column, `Expected field type in struct but found '${peek().lexeme}'`);
-            skipStatement();
+          const ft = peek();
+          if (ft.type === 'TOKEN_UNION' || ft.type === 'TOKEN_STRUCT' ||
+              ft.type === 'TOKEN_UNSIGNED' || ft.type === 'TOKEN_SIGNED' ||
+              ft.type === 'TOKEN_SHORT' || ft.type === 'TOKEN_LONG') {
+            diags.add('error', ft.line, ft.column,
+              `'${ft.lexeme}' struct fields are not supported in the NOVA C subset`);
+            skipDeclaration();
             continue;
           }
-          const ft = advanceTok();
+          if (!isTypeToken() && !isDeclTypeStart()) {
+            diags.add('error', ft.line, ft.column, `Expected field type in struct but found '${ft.lexeme}'`);
+            skipDeclaration();
+            continue;
+          }
+          const fspec = parseTypeSpec();
           const field = makeNode('NODE_STRUCT_FIELD', ft.line);
-          field.type_name = TYPE_NAMES[ft.type];
+          field.type_name = fspec.typeName;
           const fid = expect('TOKEN_IDENTIFIER', 'field name');
           field.identifier = fid ? fid.lexeme : '<error>';
           if (match('TOKEN_LBRACKET')) {
-            field.is_array = true;
-            if (check('TOKEN_INTEGER_LITERAL')) {
+            if (!check('TOKEN_INTEGER_LITERAL')) {
+              diags.add('error', peek().line, peek().column,
+                'Flexible array members are not supported in the NOVA C subset');
+              expect('TOKEN_RBRACKET', "']' after field size");
+            } else {
+              field.is_array = true;
               const sz = advanceTok();
               field.children.push((() => { const nn = makeNode('NODE_INT_LITERAL', sz.line); nn.num_val = parseInt(sz.lexeme, 16); return nn; })());
               field.has_size = true;
+              expect('TOKEN_RBRACKET', "']' after field size");
             }
-            expect('TOKEN_RBRACKET', "']' after field size");
+          }
+          if (check('TOKEN_COLON')) {
+            advanceTok();
+            diags.add('error', ft.line, ft.column, 'Bitfields are not supported in the NOVA C subset');
+            if (check('TOKEN_INTEGER_LITERAL')) advanceTok();
           }
           expect('TOKEN_SEMICOLON', "';' after struct field");
           def.children.push(field);
@@ -682,43 +1312,70 @@ function parseProgram(tokens, diags) {
       continue;
     }
 
-    if (isTypeToken()) {
-      const typeTok = advanceTok();
-      let typeName = TYPE_NAMES[typeTok.type];
-      while (check('TOKEN_STAR')) { advanceTok(); typeName += '*'; }
+    if (isTypeToken() || isDeclTypeStart()) {
+      const spec = parseTypeSpec();
+      if (!spec.hasBase && !(spec.sawUnsigned || spec.sawSigned || spec.sawShort || spec.sawLong)) {
+        diags.add('error', peek().line, peek().column, `Expected a type in declaration near '${peek().lexeme}'`);
+        skipDeclaration();
+        continue;
+      }
+      // function-pointer global:  int (*name)(...)
+      if (check('TOKEN_LPAREN') && tokens[pos + 1] && tokens[pos + 1].type === 'TOKEN_STAR') {
+        diags.add('error', peek().line, peek().column,
+          'Function pointers are not supported in the NOVA C subset');
+        skipDeclaration();
+        continue;
+      }
       const id = expect('TOKEN_IDENTIFIER', 'function or variable name');
-      if (!id) { skipStatement(); continue; }
+      if (!id) { skipDeclaration(); continue; }
       if (check('TOKEN_LPAREN')) {
         advanceTok();
-        const func = makeNode('NODE_FUNCTION_DEF', typeTok.line);
-        func.type_name = typeName;
+        const func = makeNode('NODE_FUNCTION_DEF', t.line);
+        func.type_name = spec.typeName;
         func.identifier = id.lexeme;
         parseParameterList(func);
         expect('TOKEN_RPAREN', "')' after parameters");
-        if (!check('TOKEN_LBRACE')) {
-          diags.add('error', peek().line, peek().column, "Expected '{' after function signature");
-          skipStatement();
+        if (match('TOKEN_SEMICOLON')) {
+          func.is_forward = true; // forward declaration, no body
           root.children.push(func);
           continue;
         }
-        func.children.push(parseStatement(false)); // body
+        if (!check('TOKEN_LBRACE')) {
+          diags.add('error', peek().line, peek().column, "Expected '{' after function signature");
+          skipDeclaration();
+          root.children.push(func);
+          continue;
+        }
+        func.children.push(parseStatement(false, false)); // body
         root.children.push(func);
       } else {
         // global variable(s), possibly comma-separated
-        const first = parseSingleDeclarator(typeName, typeTok.line, id);
+        const first = parseSingleDeclarator(spec.typeName, t.line, id);
+        if (spec.isStatic) first.is_static = true;
         if (!check('TOKEN_COMMA')) {
           expect('TOKEN_SEMICOLON', "';' after declaration");
           root.children.push(first);
         } else {
-          const group = makeNode('NODE_DECL_LIST', typeTok.line);
+          const group = makeNode('NODE_DECL_LIST', t.line);
           group.children.push(first);
           while (match('TOKEN_COMMA')) {
-            group.children.push(parseSingleDeclarator(typeName, typeTok.line, null));
+            const d = parseSingleDeclarator(spec.typeName, t.line, null);
+            if (spec.isStatic) d.is_static = true;
+            group.children.push(d);
           }
           expect('TOKEN_SEMICOLON', "';' after declaration");
           root.children.push(group);
         }
       }
+      continue;
+    }
+
+    // Declaration with an unknown (typedef'd) type:  jmp_buf env;  FILE *f;
+    if (t.type === 'TOKEN_IDENTIFIER' && tokens[pos + 1] &&
+        (tokens[pos + 1].type === 'TOKEN_IDENTIFIER' || tokens[pos + 1].type === 'TOKEN_STAR')) {
+      diags.add('error', t.line, t.column,
+        `Unknown type '${t.lexeme}' — typedef names are not supported in the NOVA C subset`);
+      skipDeclaration();
       continue;
     }
 
@@ -733,16 +1390,56 @@ function parseProgram(tokens, diags) {
 // Phase 3: Semantic analysis + memory layout
 // ---------------------------------------------------------------------------
 
+// Built-in functions callable from NOVA programs (VM-implemented).
+// arity -1 = variadic (printf/scanf). Deterministic and identical in both engines.
+const BUILTIN_FUNCTIONS = [
+  { name: 'printf', type: 'int', params: -1 },
+  { name: 'scanf', type: 'int', params: -1 },
+  { name: 'abs', type: 'int', params: 1 },
+  { name: 'assert', type: 'int', params: 1 },
+  { name: 'ceil', type: 'double', params: 1 },
+  { name: 'cos', type: 'double', params: 1 },
+  { name: 'exit', type: 'int', params: 1 },
+  { name: 'exp', type: 'double', params: 1 },
+  { name: 'fabs', type: 'double', params: 1 },
+  { name: 'floor', type: 'double', params: 1 },
+  { name: 'fmod', type: 'double', params: 2 },
+  { name: 'log', type: 'double', params: 1 },
+  { name: 'pow', type: 'double', params: 2 },
+  { name: 'rand', type: 'int', params: 0 },
+  { name: 'sin', type: 'double', params: 1 },
+  { name: 'sqrt', type: 'double', params: 1 },
+  { name: 'srand', type: 'int', params: 1 },
+  { name: 'tan', type: 'double', params: 1 },
+  { name: 'time', type: 'int', params: 1 }
+];
+
+// Functions that exist in libc but cannot run in the deterministic educational
+// VM — calls produce a clear diagnostic instead of cascading errors.
+const UNSUPPORTED_FUNCTIONS = new Set([
+  'malloc', 'calloc', 'realloc', 'free',
+  'fopen', 'fclose', 'fprintf', 'fscanf', 'fgets', 'fputs', 'fread', 'fwrite',
+  'fseek', 'ftell', 'rewind', 'fflush', 'setbuf', 'setvbuf', 'tmpfile', 'tmpnam',
+  'sprintf', 'snprintf', 'sscanf', 'vprintf', 'vfprintf',
+  'memcpy', 'memset', 'memmove', 'memcmp',
+  'strcmp', 'strcpy', 'strcat', 'strlen', 'strchr', 'strstr', 'strncpy',
+  'strtol', 'strtod', 'atoi', 'atof',
+  'setjmp', 'longjmp', 'signal', 'perror', 'remove', 'rename',
+  'clock', 'va_start', 'va_arg', 'va_end', 'creal', 'cimag', 'qsort', 'bsearch'
+]);
+
 function analyzeSemantics(ast, diags) {
   const symbols = [];            // serialized symbol table (insertion order)
   const globals = new Map();     // name -> symbol record
   const functions = new Map();   // name -> {node, returnType, params:[{name,type}], frame:Map}
   const structs = new Map();     // name -> {fields:Map(name->{type,offset,size,is_array}), size}
+  const staticDecls = [];        // static locals, promoted to global storage
   const globalSlots = { next: 0 };
 
   // built-ins first (stable order for the symbol table UI)
-  symbols.push({ scope: 'global', name: 'printf', kind: 'Function', type: 'int', address: '0x0000', params: -1 });
-  symbols.push({ scope: 'global', name: 'scanf', kind: 'Function', type: 'int', address: '0x0000', params: -1 });
+  for (const b of BUILTIN_FUNCTIONS) {
+    symbols.push({ scope: 'global', name: b.name, kind: 'Function', type: b.type, address: '0x0000', params: b.params });
+  }
 
   const baseTypeOf = (typeName) => typeName.replace(/\*/g, '').trim();
   const isPointerType = (typeName) => typeName.endsWith('*');
@@ -753,6 +1450,17 @@ function analyzeSemantics(ast, diags) {
     }
     return 1;
   };
+
+  // built-in global: errno (mutable integer, starts at 0)
+  {
+    const rec = {
+      name: 'errno', type: 'int', is_array: false, size: 1,
+      isGlobal: true, offset: globalSlots.next, isTemp: false, isParam: false, isBuiltinVar: true
+    };
+    globalSlots.next += 1;
+    globals.set('errno', rec);
+    symbols.push({ scope: 'global', name: 'errno', kind: 'Variable', type: 'int', address: '0x0000', params: 0 });
+  }
 
   // Pass 1: collect structs, globals, function signatures
   for (const node of ast.children) {
@@ -778,6 +1486,17 @@ function analyzeSemantics(ast, diags) {
     for (const node of declNodes) {
     if (node.type === 'NODE_FUNCTION_DEF') {
       if (functions.has(node.identifier)) {
+        const existing = functions.get(node.identifier);
+        if (existing.node.is_forward && !node.is_forward) {
+          // the real definition replaces the forward declaration
+          functions.set(node.identifier, {
+            node, returnType: node.type_name,
+            params: node.children.filter((c) => c.type === 'NODE_PARAMETER')
+              .map((p) => ({ name: p.identifier, type: p.type_name })),
+            frame: new Map(), frameSize: 0
+          });
+          continue;
+        }
         diags.add('error', node.line, 1, `Redefinition of function '${node.identifier}'`);
         continue;
       }
@@ -829,6 +1548,25 @@ function analyzeSemantics(ast, diags) {
       const size = node.is_array
         ? (node.has_size ? Math.max(1, truncateToInteger(node.children[0].num_val)) : Math.max(1, node.children.length))
         : typeSize(type);
+
+      // static locals are promoted to global storage (persistent across calls)
+      if (node.is_static && !isParam) {
+        if (globals.has(name)) {
+          diags.add('error', node.line, 1, `Redefinition of global '${name}'`);
+          return;
+        }
+        const grec = { name, type, is_array: !!node.is_array, size, isGlobal: true, offset: globalSlots.next, isTemp: false, isParam: false, isStaticLocal: true };
+        globalSlots.next += size;
+        globals.set(name, grec);
+        scope.set(name, grec);
+        symbols.push({
+          scope: fname, name, kind: node.is_array ? 'Array' : 'Variable (static)',
+          type, address: '0x' + (grec.offset * 4).toString(16).toUpperCase().padStart(4, '0'), params: 0
+        });
+        staticDecls.push(node);
+        return;
+      }
+
       const rec = { name, type, is_array: !!node.is_array, size, isGlobal: false, offset: nextSlot, isTemp: false, isParam };
       nextSlot += size;
       scope.set(name, rec);
@@ -850,12 +1588,14 @@ function analyzeSemantics(ast, diags) {
       return null;
     };
 
+    const isBuiltinFunc = (name) => BUILTIN_FUNCTIONS.some((b) => b.name === name);
+
     const resolve = (name, line) => {
       const rec = lookup(name);
       if (rec) return rec;
       if (globals.has(name)) return globals.get(name);
       if (functions.has(name)) return { name, isFunction: true };
-      if (name === 'printf' || name === 'scanf') return { name, isBuiltin: true };
+      if (isBuiltinFunc(name)) return { name, isFunction: true, isBuiltin: true };
       diags.add('error', line, 1, `Undefined identifier '${name}'`);
       return { name, type: 'int', size: 1, isGlobal: false, offset: 0, isTemp: false, isPhantom: true };
     };
@@ -921,10 +1661,23 @@ function analyzeSemantics(ast, diags) {
           return 'int';
         }
         case 'NODE_FUNC_CALL': {
-          if (node.identifier === 'printf' || node.identifier === 'scanf') return 'int';
+          const bf = BUILTIN_FUNCTIONS.find((b) => b.name === node.identifier);
+          if (bf) {
+            if (bf.params >= 0 && node.children.length !== bf.params) {
+              diags.add('error', node.line, 1,
+                `Function '${node.identifier}' expects ${bf.params} argument(s), got ${node.children.length}`);
+            }
+            return bf.type;
+          }
           const f = functions.get(node.identifier);
           if (!f) {
-            if (!resolve(node.identifier, node.line).isFunction) {
+            if (UNSUPPORTED_FUNCTIONS.has(node.identifier)) {
+              diags.add('error', node.line, 1,
+                `Function '${node.identifier}' is not supported in the NOVA C subset (no libc/heap/IO in the educational VM)`);
+              return 'int';
+            }
+            const r = resolve(node.identifier, node.line);
+            if (!r.isFunction) {
               // resolve() already reported undefined
             } else {
               diags.add('error', node.line, 1, `'${node.identifier}' is not a defined function`);
@@ -936,6 +1689,23 @@ function analyzeSemantics(ast, diags) {
               `Function '${node.identifier}' expects ${f.params.length} argument(s), got ${node.children.length}`);
           }
           return f.returnType;
+        }
+        case 'NODE_TERNARY': {
+          exprType(node.children[0]);
+          const tt = exprType(node.children[1]);
+          const et = exprType(node.children[2]);
+          return (tt === 'double' || et === 'double') ? 'double' : 'int';
+        }
+        case 'NODE_CAST': {
+          exprType(node.children[0]);
+          const tn = node.type_name || 'int';
+          if (tn.endsWith('*')) return tn;
+          if (tn === 'double' || tn === 'float') return 'double';
+          return 'int';
+        }
+        case 'NODE_SIZEOF': {
+          exprType(node.children[0]);
+          return 'int';
         }
         case 'NODE_ASSIGNMENT':
         case 'NODE_COMPOUND_ASSIGN':
@@ -973,11 +1743,11 @@ function analyzeSemantics(ast, diags) {
       (node.children || []).forEach(walkExpr);
     };
 
-    const walkStmt = (node, inLoop) => {
+    const walkStmt = (node, inLoop, inSwitch) => {
       if (!node) return;
       switch (node.type) {
         case 'NODE_DECL_LIST':
-          (node.children || []).forEach((c) => walkStmt(c, inLoop));
+          (node.children || []).forEach((c) => walkStmt(c, inLoop, inSwitch));
           return;
         case 'NODE_VAR_DECL':
           declare(node.identifier, node.type_name, node, false);
@@ -986,31 +1756,51 @@ function analyzeSemantics(ast, diags) {
           return;
         case 'NODE_COMPOUND_STMT':
           scopeStack.push(new Map());
-          (node.children || []).forEach((c) => walkStmt(c, inLoop));
+          (node.children || []).forEach((c) => walkStmt(c, inLoop, inSwitch));
           scopeStack.pop();
           return;
         case 'NODE_IF_STMT':
           walkExpr(node.children[0]);
-          walkStmt(node.children[1], inLoop);
-          if (node.children[2]) walkStmt(node.children[2], inLoop);
+          walkStmt(node.children[1], inLoop, inSwitch);
+          if (node.children[2]) walkStmt(node.children[2], inLoop, inSwitch);
           return;
         case 'NODE_WHILE_STMT':
           walkExpr(node.children[0]);
-          walkStmt(node.children[1], true);
+          walkStmt(node.children[1], true, inSwitch);
+          return;
+        case 'NODE_DO_WHILE_STMT':
+          walkStmt(node.children[0], true, inSwitch);
+          walkExpr(node.children[1]);
+          return;
+        case 'NODE_SWITCH_STMT':
+          walkExpr(node.children[0]);
+          for (let i = 1; i < node.children.length; i++) walkStmt(node.children[i], inLoop, true);
+          return;
+        case 'NODE_CASE':
+        case 'NODE_DEFAULT':
+          (node.children || []).forEach((c) => walkStmt(c, inLoop, true));
           return;
         case 'NODE_FOR_STMT':
           scopeStack.push(new Map());
-          walkStmt(node.children[0], true);
+          walkStmt(node.children[0], true, inSwitch);
           walkExpr(node.children[1]);
           walkExpr(node.children[2]);
-          walkStmt(node.children[3], true);
+          walkStmt(node.children[3], true, inSwitch);
           scopeStack.pop();
           return;
+        case 'NODE_LABEL_STMT':
+          (node.children || []).forEach((c) => walkStmt(c, inLoop, inSwitch));
+          return;
+        case 'NODE_GOTO':
+          return; // label resolution happens during TAC generation
         case 'NODE_BREAK_STMT':
+          if (!inLoop && !inSwitch) {
+            diags.add('error', node.line, 1, "'break' used outside of a loop or switch");
+          }
+          return;
         case 'NODE_CONTINUE_STMT':
           if (!inLoop) {
-            diags.add('error', node.line, 1,
-              `'${node.type === 'NODE_BREAK_STMT' ? 'break' : 'continue'}' used outside of a loop`);
+            diags.add('error', node.line, 1, "'continue' used outside of a loop");
           }
           return;
         case 'NODE_RETURN_STMT':
@@ -1020,16 +1810,16 @@ function analyzeSemantics(ast, diags) {
           (node.children || []).forEach(walkExpr);
           return;
         default:
-          (node.children || []).forEach((c) => walkStmt(c, inLoop));
+          (node.children || []).forEach((c) => walkStmt(c, inLoop, inSwitch));
       }
     };
 
     const body = frec.node.children.find((c) => c.type !== 'NODE_PARAMETER');
-    walkStmt(body, false);
+    walkStmt(body, false, false);
     frec.frameSize = nextSlot;
   }
 
-  return { symbols, globals, functions, structs, globalSlotCount: globalSlots.next };
+  return { symbols, globals, functions, structs, staticDecls, globalSlotCount: globalSlots.next };
 }
 
 // ---------------------------------------------------------------------------
@@ -1116,12 +1906,59 @@ function generateTAC(ast, sem, diags) {
       }
       const l = genExpr(node.children[0]);
       const r = genExpr(node.children[1]);
-      const resType = ['==', '!=', '<', '>', '<=', '>='].includes(op)
+      const isBitwise = ['&', '|', '^', '<<', '>>'].includes(op);
+      const resType = ['==', '!=', '<', '>', '<=', '>='].includes(op) || isBitwise
         ? 'int'
         : (isFloatType(l.type) || isFloatType(r.type)) ? 'double' : 'int';
       const t = newTemp(resType);
       emit(op, t, l.place, r.place, node.line);
       return { place: t, type: resType, isConst: false };
+    }
+
+    if (node.type === 'NODE_TERNARY') {
+      const cond = genExpr(node.children[0]);
+      const t = newTemp('int'); // refined after branch codegen below
+      const lf = newLabel();
+      const le = newLabel();
+      emit('IF_FALSE', lf, cond.place, '', node.line);
+      const tv = genExpr(node.children[1]);
+      emit('=', t, tv.place, '', node.line);
+      emit('GOTO', le, '', '', node.line);
+      emit('LABEL', lf, '', '', node.line);
+      const ev = genExpr(node.children[2]);
+      emit('=', t, ev.place, '', node.line);
+      emit('LABEL', le, '', '', node.line);
+      const resType = (tv.type === 'double' || ev.type === 'double') ? 'double' : 'int';
+      tempTypes.set(t, resType);
+      return { place: t, type: resType, isConst: false };
+    }
+
+    if (node.type === 'NODE_CAST') {
+      const v = genExpr(node.children[0]);
+      const tn = node.type_name || 'int';
+      if (tn.endsWith('*') || tn === 'void') {
+        return v; // pointer casts are identity in the educational VM
+      }
+      const isF = tn === 'double' || tn === 'float';
+      const t = newTemp(isF ? 'double' : 'int');
+      emit(isF ? 'CAST_F' : 'CAST_I', t, v.place, '', node.line);
+      return { place: t, type: isF ? 'double' : 'int', isConst: false };
+    }
+
+    if (node.type === 'NODE_SIZEOF') {
+      const child = node.children[0];
+      if (child && child.type === 'NODE_IDENTIFIER') {
+        const rec = findAnySymbol(child.identifier);
+        if (rec) {
+          if (rec.is_array) return { place: String(rec.size * 4), type: 'int', isConst: true };
+          if (typeof rec.type === 'string' && rec.type.endsWith('*')) return { place: '8', type: 'int', isConst: true };
+          if (rec.type === 'double') return { place: '8', type: 'int', isConst: true };
+          return { place: '4', type: 'int', isConst: true };
+        }
+      }
+      const v = genExpr(child);
+      const size = (v.type === 'double' || v.type === 'ptr' || String(v.type).endsWith('*')) ? '8' : '4';
+      return { place: size, type: 'int', isConst: true };
     }
 
     if (node.type === 'NODE_UNARY_OP') {
@@ -1135,6 +1972,12 @@ function generateTAC(ast, sem, diags) {
         const v = genExpr(node.children[0]);
         const t = newTemp('int');
         emit('!', t, v.place, '', node.line);
+        return { place: t, type: 'int', isConst: false };
+      }
+      if (node.op === '~') {
+        const v = genExpr(node.children[0]);
+        const t = newTemp('int');
+        emit('~', t, v.place, '', node.line);
         return { place: t, type: 'int', isConst: false };
       }
       if (node.op === '&') {
@@ -1315,7 +2158,8 @@ function generateTAC(ast, sem, diags) {
       return rhs;
     }
     // compound: read lvalue once, apply op, store back
-    const opMap = { '+=': '+', '-=': '-', '*=': '*', '/=': '/', '%=': '%' };
+    const opMap = { '+=': '+', '-=': '-', '*=': '*', '/=': '/', '%=': '%',
+                    '&=': '&', '|=': '|', '^=': '^', '<<=': '<<', '>>=': '>>' };
     const op = opMap[node.op];
     const lv = lvalueAddr(target);
     if (!lv) return { place: '0', type: 'int' };
@@ -1349,7 +2193,25 @@ function generateTAC(ast, sem, diags) {
   // ---- statements ----
   const loopStack = [];
 
-  function genVarDecl(node) {
+  // per-function goto-label registry (pre-scanned so forward gotos work)
+  let labelMap = new Map();
+  function collectLabels(node) {
+    if (!node) return;
+    if (node.type === 'NODE_LABEL_STMT' && !labelMap.has(node.identifier)) {
+      labelMap.set(node.identifier, newLabel());
+    }
+    (node.children || []).forEach(collectLabels);
+  }
+  function registerLabel(name) {
+    if (!labelMap.has(name)) labelMap.set(name, newLabel());
+    return labelMap.get(name);
+  }
+  function findLabel(name) {
+    return labelMap.has(name) ? labelMap.get(name) : null;
+  }
+
+  // Emits initializer code for a variable declaration (arrays or scalar).
+  function emitVarDeclInit(node) {
     if (node.is_array) {
       // children[0] = size literal when has_size, rest = initializer values
       const inits = node.has_size ? node.children.slice(1) : node.children.slice(0);
@@ -1365,6 +2227,13 @@ function generateTAC(ast, sem, diags) {
       const v = genExpr(node.children[0]);
       emit('=', node.identifier, v.place, '', node.line);
     }
+  }
+
+  function genVarDecl(node) {
+    // static locals are initialized exactly once in the global-init prologue,
+    // never on each call
+    if (node.is_static) return;
+    emitVarDeclInit(node);
   }
 
   function genStmt(node) {
@@ -1404,7 +2273,7 @@ function generateTAC(ast, sem, diags) {
     if (node.type === 'NODE_WHILE_STMT') {
       const lStart = newLabel();
       const lEnd = newLabel();
-      loopStack.push({ brk: lEnd, cont: lStart });
+      loopStack.push({ brk: lEnd, cont: lStart, isSwitch: false });
       emit('LABEL', lStart, '', '', node.line);
       const cond = genExpr(node.children[0]);
       emit('IF_FALSE', lEnd, cond.place, '', node.line);
@@ -1415,13 +2284,77 @@ function generateTAC(ast, sem, diags) {
       return;
     }
 
+    if (node.type === 'NODE_DO_WHILE_STMT') {
+      const lStart = newLabel();
+      const lEnd = newLabel();
+      loopStack.push({ brk: lEnd, cont: lStart, isSwitch: false });
+      emit('LABEL', lStart, '', '', node.line);
+      genStmt(node.children[0]);
+      const cond = genExpr(node.children[1]);
+      emit('IF_FALSE', lEnd, cond.place, '', node.line);
+      emit('GOTO', lStart, '', '', node.line);
+      emit('LABEL', lEnd, '', '', node.line);
+      loopStack.pop();
+      return;
+    }
+
+    if (node.type === 'NODE_SWITCH_STMT') {
+      const sel = genExpr(node.children[0]);
+      const lEnd = newLabel();
+      loopStack.push({ brk: lEnd, cont: null, isSwitch: true });
+      // jump table: test each case in order
+      const caseLabels = [];
+      let defaultLabel = null;
+      // first pass: create labels
+      for (let i = 1; i < node.children.length; i++) {
+        const c = node.children[i];
+        caseLabels.push(newLabel());
+        if (c.type === 'NODE_DEFAULT') defaultLabel = caseLabels[caseLabels.length - 1];
+      }
+      for (let i = 1; i < node.children.length; i++) {
+        const c = node.children[i];
+        if (c.type === 'NODE_CASE') {
+          const t = newTemp('int');
+          emit('==', t, sel.place, String(truncateToInteger(c.num_val)), c.line);
+          const lNext = newLabel();
+          emit('IF_FALSE', lNext, t, '', c.line);
+          emit('GOTO', caseLabels[i - 1], '', '', c.line);
+          emit('LABEL', lNext, '', '', c.line);
+        }
+      }
+      emit('GOTO', defaultLabel || lEnd, '', '', node.line);
+      // second pass: bodies
+      for (let i = 1; i < node.children.length; i++) {
+        const c = node.children[i];
+        emit('LABEL', caseLabels[i - 1], '', '', c.line);
+        for (const st of c.children) genStmt(st);
+      }
+      emit('LABEL', lEnd, '', '', node.line);
+      loopStack.pop();
+      return;
+    }
+
+    if (node.type === 'NODE_GOTO') {
+      const lbl = findLabel(node.identifier);
+      if (lbl) emit('GOTO', lbl, '', '', node.line);
+      else diags.add('error', node.line, 1, `Use of undefined label '${node.identifier}'`);
+      return;
+    }
+
+    if (node.type === 'NODE_LABEL_STMT') {
+      const lbl = registerLabel(node.identifier);
+      emit('LABEL', lbl, '', '', node.line);
+      if (node.children[0]) genStmt(node.children[0]);
+      return;
+    }
+
     if (node.type === 'NODE_FOR_STMT') {
       const [init, cond, incr, body] = node.children;
       const lStart = newLabel();
       const lStep = newLabel();
       const lEnd = newLabel();
       genStmt(init);
-      loopStack.push({ brk: lEnd, cont: lStep });
+      loopStack.push({ brk: lEnd, cont: lStep, isSwitch: false });
       emit('LABEL', lStart, '', '', node.line);
       if (cond.type !== 'NODE_EMPTY') {
         const c = genExpr(cond);
@@ -1442,8 +2375,13 @@ function generateTAC(ast, sem, diags) {
       return;
     }
     if (node.type === 'NODE_CONTINUE_STMT') {
-      const loop = loopStack[loopStack.length - 1];
-      if (loop) emit('GOTO', loop.cont, '', '', node.line);
+      // continue targets the innermost *loop*, skipping any enclosing switch
+      for (let i = loopStack.length - 1; i >= 0; i--) {
+        if (!loopStack[i].isSwitch && loopStack[i].cont) {
+          emit('GOTO', loopStack[i].cont, '', '', node.line);
+          return;
+        }
+      }
       return;
     }
 
@@ -1459,26 +2397,29 @@ function generateTAC(ast, sem, diags) {
   }
 
   // Global (file-scope) initializers run once, at the very start of main.
+  // Static locals were promoted to global storage; their initializers also run
+  // here (exactly once), never on each call.
   function emitGlobalInits() {
     for (const top of ast.children) {
       const decls = top.type === 'NODE_DECL_LIST' ? top.children : [top];
       for (const d of decls) {
         if (!d || d.type !== 'NODE_VAR_DECL') continue;
-        if (d.is_array) {
-          genVarDecl(d);
-        } else if (d.children.length > 0) {
-          const v = genExpr(d.children[0]);
-          emit('=', d.identifier, v.place, '', d.line);
-        }
+        emitVarDeclInit(d);
       }
+    }
+    for (const d of (sem.staticDecls || [])) {
+      emitVarDeclInit(d);
     }
   }
 
   for (const top of ast.children) {
     if (top.type !== 'NODE_FUNCTION_DEF') continue;
+    if (top.is_forward) continue; // forward declaration — no body
     emit('FUNC_BEGIN', top.identifier, '', '', top.line);
-    if (top.identifier === 'main') emitGlobalInits();
+    labelMap = new Map();
     const body = top.children.find((c) => c.type !== 'NODE_PARAMETER');
+    collectLabels(body);
+    if (top.identifier === 'main') emitGlobalInits();
     genStmt(body);
     // implicit return when control reaches the end of the body
     const last = instrs[instrs.length - 1];
@@ -1496,7 +2437,7 @@ function generateTAC(ast, sem, diags) {
 // reduction, dead code elimination) — real rewrites with real metrics.
 // ---------------------------------------------------------------------------
 
-const BIN_OPS = new Set(['+', '-', '*', '/', '%', '==', '!=', '<', '>', '<=', '>=']);
+const BIN_OPS = new Set(['+', '-', '*', '/', '%', '==', '!=', '<', '>', '<=', '>=', '&', '|', '^', '<<', '>>']);
 
 function parseTacNumber(s) {
   if (!/^-?\d+$/.test(s)) return null;
@@ -1529,6 +2470,12 @@ function optimizeTAC(instrs, tempTypes) {
       case '>': return a > b ? 1 : 0;
       case '<=': return a <= b ? 1 : 0;
       case '>=': return a >= b ? 1 : 0;
+      // bitwise: int32 semantics, identical to the VM
+      case '&': return (a | 0) & (b | 0);
+      case '|': return (a | 0) | (b | 0);
+      case '^': return (a | 0) ^ (b | 0);
+      case '<<': return (a | 0) << (b | 0);
+      case '>>': return (a | 0) >> (b | 0);
       default: return null;
     }
   };
@@ -1552,6 +2499,13 @@ function optimizeTAC(instrs, tempTypes) {
       if (a !== null) {
         ins.op = '=';
         ins.a1 = String(-a);
+        metrics.constant_fold++;
+      }
+    } else if (ins.op === '~') {
+      const a = parseTacNumber(ins.a1);
+      if (a !== null) {
+        ins.op = '=';
+        ins.a1 = String(~(a | 0));
         metrics.constant_fold++;
       }
     }
@@ -1605,7 +2559,7 @@ function optimizeTAC(instrs, tempTypes) {
       if (isPlainPlace(ins.a1) && ins.a1.startsWith('t')) used.add(ins.a1);
       if (isPlainPlace(ins.a2) && ins.a2.startsWith('t')) used.add(ins.a2);
     }
-    const pureOps = new Set(['=', '+', '-', '*', '/', '%', 'neg', '!', '==', '!=', '<', '>', '<=', '>=']);
+    const pureOps = new Set(['=', '+', '-', '*', '/', '%', 'neg', '!', '~', '==', '!=', '<', '>', '<=', '>=', '&', '|', '^', '<<', '>>', 'CAST_I', 'CAST_F']);
     let removedAny = false;
     const next = [];
     for (const ins of list) {
@@ -1725,11 +2679,13 @@ function generateBytecode(optTac, sem, tempTypes, strings) {
       }
       case '+': case '-': case '*': case '/': case '%':
       case '==': case '!=': case '<': case '>': case '<=': case '>=':
-      case '&&': case '||': {
+      case '&&': case '||':
+      case '&': case '|': case '^': case '<<': case '>>': {
         pushPlace(ins.a1, ins.line);
         pushPlace(ins.a2, ins.line);
         let op = { '+': 'ADD', '-': 'SUB', '*': 'MUL', '%': 'MOD', '==': 'EQ', '!=': 'NEQ',
-                   '<': 'LT', '>': 'GT', '<=': 'LEQ', '>=': 'GEQ', '&&': 'AND', '||': 'OR' }[ins.op];
+                   '<': 'LT', '>': 'GT', '<=': 'LEQ', '>=': 'GEQ', '&&': 'AND', '||': 'OR',
+                   '&': 'BAND', '|': 'BOR', '^': 'BXOR', '<<': 'SHL', '>>': 'SHR' }[ins.op];
         if (ins.op === '/') {
           const lt = tempTypes.get(ins.a1);
           const rt = tempTypes.get(ins.a2);
@@ -1751,6 +2707,27 @@ function generateBytecode(optTac, sem, tempTypes, strings) {
       case '!': {
         pushPlace(ins.a1, ins.line);
         emitInstr('NOT', 0, ins.res, ins.line);
+        const info = placeInfo(ins.res);
+        emitInstr('STORE', 0, ins.res, ins.line, { slot: info.slot, isGlobal: info.isGlobal });
+        break;
+      }
+      case '~': {
+        pushPlace(ins.a1, ins.line);
+        emitInstr('BNOT', 0, ins.res, ins.line);
+        const info = placeInfo(ins.res);
+        emitInstr('STORE', 0, ins.res, ins.line, { slot: info.slot, isGlobal: info.isGlobal });
+        break;
+      }
+      case 'CAST_I': {
+        pushPlace(ins.a1, ins.line);
+        emitInstr('CVT_I', 0, ins.res, ins.line);
+        const info = placeInfo(ins.res);
+        emitInstr('STORE', 0, ins.res, ins.line, { slot: info.slot, isGlobal: info.isGlobal });
+        break;
+      }
+      case 'CAST_F': {
+        pushPlace(ins.a1, ins.line);
+        emitInstr('CVT_F', 0, ins.res, ins.line);
         const info = placeInfo(ins.res);
         emitInstr('STORE', 0, ins.res, ins.line, { slot: info.slot, isGlobal: info.isGlobal });
         break;
@@ -1875,6 +2852,52 @@ function runVirtualMachine(chunk, sem, inputs) {
 
   const fmtNumber = (v) => (isIntegral(v) ? String(truncateToInteger(v)) : String(v));
 
+  // deterministic PRNG state (glibc-style LCG), identical in the C backend
+  let randState = 1;
+
+  // Built-in functions implemented by the VM itself. Returns true when the
+  // call was handled (a result value is pushed for value-returning builtins).
+  function callBuiltinFunction(instr) {
+    const name = instr.symbol;
+    const nargs = instr.operand;
+    if (stack.length < nargs) { runtimeError(`Stack underflow in ${name}`, instr.line); return true; }
+    const args = stack.splice(stack.length - nargs, nargs).map((c) => c.n || 0);
+
+    switch (name) {
+      case 'sqrt': push(Math.sqrt(args[0])); return true;
+      case 'pow': push(Math.pow(args[0], args[1])); return true;
+      case 'sin': push(Math.sin(args[0])); return true;
+      case 'cos': push(Math.cos(args[0])); return true;
+      case 'tan': push(Math.tan(args[0])); return true;
+      case 'log': push(Math.log(args[0])); return true;
+      case 'exp': push(Math.exp(args[0])); return true;
+      case 'ceil': push(Math.ceil(args[0])); return true;
+      case 'floor': push(Math.floor(args[0])); return true;
+      case 'fabs': push(Math.abs(args[0])); return true;
+      case 'abs': push(Math.abs(truncateToInteger(args[0]))); return true;
+      case 'fmod': push(args[0] % args[1]); return true;
+      case 'rand': {
+        randState = (Math.imul(randState, 1103515245) + 12345) | 0;
+        push((randState >>> 16) & 0x7fff);
+        return true;
+      }
+      case 'srand': { randState = truncateToInteger(args[0]) | 0; push(0); return true; }
+      case 'time': { push(1700000000); return true; } /* fixed constant for determinism */
+      case 'exit': { exitCode = truncateToInteger(args[0]); halted = true; return true; }
+      case 'assert': {
+        if (truncateToInteger(args[0]) === 0) {
+          runtimeError('Assertion failed', instr.line);
+        }
+        push(0);
+        return true;
+      }
+      default:
+        // not a builtin — restore args and report undefined
+        for (let i = args.length - 1; i >= 0; i--) stack.push({ n: args[i] });
+        return false;
+    }
+  }
+
   function recordStep(pc, instr) {
     if (steps.length >= TRACE_MAX_STEPS) { truncated = true; return; }
     const frame = frames[frames.length - 1];
@@ -1913,6 +2936,12 @@ function runVirtualMachine(chunk, sem, inputs) {
     }
   }
 
+  const toUnsigned32 = (v) => {
+    let t = truncateToInteger(v) % 4294967296;
+    if (t < 0) t += 4294967296;
+    return t;
+  };
+
   function formatPrintf(fmt, args) {
     let out = '';
     let ai = 0;
@@ -1921,6 +2950,10 @@ function runVirtualMachine(chunk, sem, inputs) {
       if (ch !== '%') { out += ch; continue; }
       i++;
       if (fmt[i] === '%') { out += '%'; continue; }
+      // flags
+      while (i < fmt.length && '-+ #0'.includes(fmt[i])) i++;
+      // width (ignored for alignment in the educational VM, but consumed)
+      while (i < fmt.length && /[0-9]/.test(fmt[i])) i++;
       let prec = -1;
       if (fmt[i] === '.') {
         i++;
@@ -1928,17 +2961,42 @@ function runVirtualMachine(chunk, sem, inputs) {
         while (i < fmt.length && /[0-9]/.test(fmt[i])) digits += fmt[i++];
         prec = digits === '' ? 0 : parseInt(digits, 10);
       }
-      while (fmt[i] === 'l' || fmt[i] === 'h') i++;
+      while (fmt[i] === 'l' || fmt[i] === 'h' || fmt[i] === 'z' || fmt[i] === 'j' || fmt[i] === 't') i++;
       const conv = fmt[i];
       const arg = ai < args.length ? args[ai++] : { n: 0 };
+      const num = arg.n || 0;
       if (conv === 'd' || conv === 'i') {
-        out += String(truncateToInteger(arg.n || 0));
+        out += String(truncateToInteger(num));
+      } else if (conv === 'u') {
+        out += String(toUnsigned32(num));
+      } else if (conv === 'x') {
+        out += toUnsigned32(num).toString(16);
+      } else if (conv === 'X') {
+        out += toUnsigned32(num).toString(16).toUpperCase();
+      } else if (conv === 'o') {
+        out += toUnsigned32(num).toString(8);
+      } else if (conv === 'p') {
+        out += '0x' + toUnsigned32(num).toString(16);
       } else if (conv === 'f') {
-        out += (arg.n || 0).toFixed(prec === -1 ? 6 : prec);
+        out += num.toFixed(prec === -1 ? 6 : prec);
+      } else if (conv === 'e' || conv === 'E') {
+        out += num.toExponential(prec === -1 ? 6 : prec);
+      } else if (conv === 'g' || conv === 'G') {
+        out += String(num);
       } else if (conv === 'c') {
-        out += String.fromCharCode(truncateToInteger(arg.n || 0) & 0xff);
+        out += String.fromCharCode(truncateToInteger(num) & 0xff);
       } else if (conv === 's') {
-        out += arg.s !== undefined ? (strings[arg.s] || '') : String(arg.n || 0);
+        // string pointer: read chars from memory until NUL
+        let addr = truncateToInteger(num);
+        let s = '';
+        let guard = 0;
+        while (addr >= 0 && addr < MEM_MAX && guard < 4096) {
+          const ch = mem[addr];
+          if (ch === 0) break;
+          s += String.fromCharCode(ch);
+          addr++; guard++;
+        }
+        out += s;
       } else {
         out += '%' + (conv || '');
       }
@@ -1946,16 +3004,28 @@ function runVirtualMachine(chunk, sem, inputs) {
     return out;
   }
 
-  // ---- boot: call main ----
+  // ---- boot: intern string literals into memory, then call main ----
   const mainPC = funcPC.get('main');
   if (mainPC === undefined) {
     runtimeError("No 'main' entry point in bytecode");
     return finish();
   }
 
+  // String literals live in memory (one slot per char + NUL) so they can be
+  // stored in char* variables and read back by printf("%s", p).
+  const strBase = [];
+  let cursor = sem.globalSlotCount;
+  for (let si = 0; si < strings.length; si++) {
+    strBase[si] = cursor;
+    const s = strings[si];
+    for (let k = 0; k < s.length && cursor < MEM_MAX; k++) mem[cursor++] = s.charCodeAt(k);
+    if (cursor < MEM_MAX) mem[cursor++] = 0;
+  }
+
   const mainFrameSize = frameSizeOf('main');
-  frames.push({ func: 'main', retPC: -1, bp: sem.globalSlotCount });
-  let memTop = sem.globalSlotCount + mainFrameSize;
+  const mainBP = cursor;
+  frames.push({ func: 'main', retPC: -1, bp: mainBP });
+  let memTop = mainBP + mainFrameSize;
   let pc = mainPC;
   let stepsExecuted = 0;
 
@@ -1977,7 +3047,7 @@ function runVirtualMachine(chunk, sem, inputs) {
 
     switch (instr.op) {
       case 'PUSH': push(instr.operand); pc++; break;
-      case 'PUSH_STR': pushStr(instr.operand); pc++; break;
+      case 'PUSH_STR': push(instr.operand < strBase.length ? strBase[instr.operand] : 0); pc++; break;
       case 'POP': if (stack.length) stack.pop(); pc++; break;
       case 'LOAD': {
         const addr = instr.isGlobal ? instr.slot : frames[frames.length - 1].bp + instr.slot;
@@ -2063,11 +3133,24 @@ function runVirtualMachine(chunk, sem, inputs) {
       case 'GEQ': { const b = pop(), a = pop(); push((a.n || 0) >= (b.n || 0) ? 1 : 0); pc++; break; }
       case 'AND': { const b = pop(), a = pop(); push((a.n || 0) !== 0 && (b.n || 0) !== 0 ? 1 : 0); pc++; break; }
       case 'OR': { const b = pop(), a = pop(); push((a.n || 0) !== 0 || (b.n || 0) !== 0 ? 1 : 0); pc++; break; }
+      // bitwise ops use int32 semantics (identical in the JS and C VMs)
+      case 'BAND': { const b = pop(), a = pop(); push(truncateToInteger(a.n || 0) & truncateToInteger(b.n || 0)); pc++; break; }
+      case 'BOR': { const b = pop(), a = pop(); push(truncateToInteger(a.n || 0) | truncateToInteger(b.n || 0)); pc++; break; }
+      case 'BXOR': { const b = pop(), a = pop(); push(truncateToInteger(a.n || 0) ^ truncateToInteger(b.n || 0)); pc++; break; }
+      case 'BNOT': { const a = pop(); push(~truncateToInteger(a.n || 0)); pc++; break; }
+      case 'SHL': { const b = pop(), a = pop(); push(truncateToInteger(a.n || 0) << (truncateToInteger(b.n || 0) & 31)); pc++; break; }
+      case 'SHR': { const b = pop(), a = pop(); push(truncateToInteger(a.n || 0) >> (truncateToInteger(b.n || 0) & 31)); pc++; break; }
+      case 'CVT_I': { const a = pop(); push(truncateToInteger(a.n || 0)); pc++; break; }
+      case 'CVT_F': { const a = pop(); push(a.n || 0); pc++; break; }
       case 'JMP': pc = instr.operand; break;
       case 'JZ': { const v = pop(); pc = (v.n || 0) === 0 ? instr.operand : pc + 1; break; }
       case 'CALL': {
         const target = funcPC.get(instr.symbol);
-        if (target === undefined) { runtimeError(`Call to undefined function '${instr.symbol}'`, instr.line); break; }
+        if (target === undefined) {
+          if (callBuiltinFunction(instr)) { pc++; break; }
+          runtimeError(`Call to undefined function '${instr.symbol}'`, instr.line);
+          break;
+        }
         if (frames.length >= CALL_DEPTH_MAX) { runtimeError('Call stack overflow (recursion too deep)', instr.line); break; }
         const nargs = instr.operand;
         if (stack.length < nargs) { runtimeError('Stack underflow in CALL', instr.line); break; }

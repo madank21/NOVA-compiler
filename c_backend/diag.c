@@ -13,8 +13,7 @@ DiagList* diag_list_new(void) {
     return list;
 }
 
-void diag_add(DiagList* list, const char* level, int line, int column, const char* fmt, ...) {
-    if (!list) return;
+static void diag_push(DiagList* list, const char* level, int line, int column, const char* msg) {
     if (list->count >= list->capacity) {
         list->capacity *= 2;
         Diag* grown = (Diag*)realloc(list->items, sizeof(Diag) * (size_t)list->capacity);
@@ -25,10 +24,30 @@ void diag_add(DiagList* list, const char* level, int line, int column, const cha
     d->level = level;
     d->line = line;
     d->column = column;
+    snprintf(d->msg, sizeof(d->msg), "%s", msg);
+}
+
+void diag_add(DiagList* list, const char* level, int line, int column, const char* fmt, ...) {
+    if (!list) return;
+    /* Cap mirrors the JS engine: after the limit, emit one note then stop. */
+    if (list->count >= NOVA_DIAGNOSTIC_LIMIT) {
+        if (!list->limit_note_added) {
+            list->limit_note_added = 1;
+            char note[256];
+            snprintf(note, sizeof(note),
+                "Diagnostic limit (%d) reached \xe2\x80\x94 further diagnostics suppressed. "
+                "The program likely uses constructs outside the NOVA C subset.",
+                NOVA_DIAGNOSTIC_LIMIT);
+            diag_push(list, "warning", 0, 0, note);
+        }
+        return;
+    }
+    char msg[256];
     va_list args;
     va_start(args, fmt);
-    vsnprintf(d->msg, sizeof(d->msg), fmt, args);
+    vsnprintf(msg, sizeof(msg), fmt, args);
     va_end(args);
+    diag_push(list, level, line, column, msg);
 }
 
 int diag_has_errors(const DiagList* list) {
