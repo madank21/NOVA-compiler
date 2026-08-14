@@ -925,13 +925,13 @@ function parseProgram(tokens, diags) {
       decl.is_array = true;
       if (check('TOKEN_INTEGER_LITERAL')) {
         const sz = advanceTok();
-        decl.children.push((() => { const nn = makeNode('NODE_INT_LITERAL', sz.line); nn.num_val = parseInt(sz.lexeme, 16); return nn; })());
+        decl.children.push((() => { const nn = makeNode('NODE_INT_LITERAL', sz.line); nn.num_val = parseInt(sz.lexeme, 10); return nn; })());
         decl.has_size = true;
       }
       expect('TOKEN_RBRACKET', "']' after array size");
     }
     if (match('TOKEN_ASSIGN')) {
-      if (decl.is_array && check('TOKEN_LBRACE')) {
+      if ((decl.is_array || type.startsWith('struct ')) && check('TOKEN_LBRACE')) {
         advanceTok();
         while (!check('TOKEN_RBRACE') && !check('TOKEN_EOF')) {
           decl.children.push(parseExpression());
@@ -1225,6 +1225,13 @@ function parseProgram(tokens, diags) {
       const param = makeNode('NODE_PARAMETER', id ? id.line : func.line);
       param.type_name = spec.typeName;
       param.identifier = id ? id.lexeme : '<error>';
+      // array parameter: int arr[] (optional size accepted and ignored —
+      // the parameter decays to a pointer, exactly like C)
+      if (match('TOKEN_LBRACKET')) {
+        while (!check('TOKEN_RBRACKET') && !check('TOKEN_EOF') && !check('TOKEN_COMMA')) advanceTok();
+        if (match('TOKEN_RBRACKET')) { /* consumed */ }
+        param.is_array = true;
+      }
       func.children.push(param);
       if (match('TOKEN_COMMA')) continue;
       break;
@@ -1263,15 +1270,15 @@ function parseProgram(tokens, diags) {
         def.identifier = nameTok ? nameTok.lexeme : '<error>';
         while (!check('TOKEN_RBRACE') && !check('TOKEN_EOF')) {
           const ft = peek();
-          if (ft.type === 'TOKEN_UNION' || ft.type === 'TOKEN_STRUCT' ||
-              ft.type === 'TOKEN_UNSIGNED' || ft.type === 'TOKEN_SIGNED' ||
-              ft.type === 'TOKEN_SHORT' || ft.type === 'TOKEN_LONG') {
+          if (ft.type === 'TOKEN_UNION' || ft.type === 'TOKEN_UNSIGNED' ||
+              ft.type === 'TOKEN_SIGNED' || ft.type === 'TOKEN_SHORT' ||
+              ft.type === 'TOKEN_LONG') {
             diags.add('error', ft.line, ft.column,
               `'${ft.lexeme}' struct fields are not supported in the NOVA C subset`);
             skipDeclaration();
             continue;
           }
-          if (!isTypeToken() && !isDeclTypeStart()) {
+          if (!isTypeToken() && !isDeclTypeStart() && ft.type !== 'TOKEN_STRUCT') {
             diags.add('error', ft.line, ft.column, `Expected field type in struct but found '${ft.lexeme}'`);
             skipDeclaration();
             continue;
@@ -1289,7 +1296,7 @@ function parseProgram(tokens, diags) {
             } else {
               field.is_array = true;
               const sz = advanceTok();
-              field.children.push((() => { const nn = makeNode('NODE_INT_LITERAL', sz.line); nn.num_val = parseInt(sz.lexeme, 16); return nn; })());
+              field.children.push((() => { const nn = makeNode('NODE_INT_LITERAL', sz.line); nn.num_val = parseInt(sz.lexeme, 10); return nn; })());
               field.has_size = true;
               expect('TOKEN_RBRACKET', "']' after field size");
             }
@@ -1472,7 +1479,8 @@ function analyzeSemantics(ast, diags) {
       const fields = new Map();
       let offset = 0;
       for (const f of node.children) {
-        const size = f.is_array ? (f.has_size ? Math.max(1, truncateToInteger(f.children[0].num_val)) : 1) : 1;
+        const size = f.is_array ? (f.has_size ? Math.max(1, truncateToInteger(f.children[0].num_val)) : 1)
+          : (f.type_name.startsWith('struct ') ? (structs.get(f.type_name.slice(7)) || { size: 1 }).size : 1);
         fields.set(f.identifier, { type: f.type_name, offset, size, is_array: !!f.is_array });
         offset += size;
       }
@@ -1492,7 +1500,7 @@ function analyzeSemantics(ast, diags) {
           functions.set(node.identifier, {
             node, returnType: node.type_name,
             params: node.children.filter((c) => c.type === 'NODE_PARAMETER')
-              .map((p) => ({ name: p.identifier, type: p.type_name })),
+              .map((p) => ({ name: p.identifier, type: p.type_name, is_array: !!p.is_array })),
             frame: new Map(), frameSize: 0
           });
           continue;
@@ -1501,7 +1509,7 @@ function analyzeSemantics(ast, diags) {
         continue;
       }
       const params = node.children.filter((c) => c.type === 'NODE_PARAMETER')
-        .map((p) => ({ name: p.identifier, type: p.type_name }));
+        .map((p) => ({ name: p.identifier, type: p.type_name, is_array: !!p.is_array }));
       functions.set(node.identifier, { node, returnType: node.type_name, params, frame: new Map(), frameSize: 0 });
       symbols.push({
         scope: 'global', name: node.identifier, kind: 'Function', type: node.type_name,
@@ -1513,7 +1521,10 @@ function analyzeSemantics(ast, diags) {
         continue;
       }
       const size = node.is_array
-        ? (node.has_size ? Math.max(1, truncateToInteger(node.children[0].num_val)) : Math.max(1, node.children.length))
+        ? (node.has_size ? Math.max(1, truncateToInteger(node.children[0].num_val))
+           : (node.children.length > 1 ? node.children.length
+              : (node.children.length === 1 && node.children[0].type === 'NODE_STRING_LITERAL'
+                 ? String(node.children[0].string_val).length + 1 : 1)))
         : typeSize(node.type_name);
       const rec = {
         name: node.identifier, type: node.type_name, is_array: !!node.is_array,
@@ -1546,7 +1557,10 @@ function analyzeSemantics(ast, diags) {
         return;
       }
       const size = node.is_array
-        ? (node.has_size ? Math.max(1, truncateToInteger(node.children[0].num_val)) : Math.max(1, node.children.length))
+        ? (node.has_size ? Math.max(1, truncateToInteger(node.children[0].num_val))
+           : (node.children.length > 1 ? node.children.length
+              : (node.children.length === 1 && node.children[0].type === 'NODE_STRING_LITERAL'
+                 ? String(node.children[0].string_val).length + 1 : 1)))
         : typeSize(type);
 
       // static locals are promoted to global storage (persistent across calls)
@@ -1572,13 +1586,13 @@ function analyzeSemantics(ast, diags) {
       scope.set(name, rec);
       frame.set(name, rec);
       symbols.push({
-        scope: fname, name, kind: node.is_array ? 'Array' : (isParam ? 'Parameter' : 'Variable'),
+        scope: fname, name, kind: isParam ? 'Parameter' : (node.is_array ? 'Array' : 'Variable'),
         type, address: '0x' + (rec.offset * 4).toString(16).toUpperCase().padStart(4, '0'), params: 0
       });
     };
 
     for (const p of frec.params) {
-      declare(p.name, p.type, { line: frec.node.line, is_array: false, children: [] }, true);
+      declare(p.name, p.type, { line: frec.node.line, is_array: !!p.is_array, children: [] }, true);
     }
 
     const lookup = (name) => {
@@ -1847,7 +1861,8 @@ function generateTAC(ast, sem, diags) {
 
   function constString(v, type) {
     if (isFloatType(type)) {
-      return isIntegral(v) && Math.abs(v) < 1e15 ? String(Math.trunc(v)) + '.0' : String(v);
+      if (isIntegral(v)) return String(truncateToInteger(v)) + '.0';
+      return cFormatValue(v);
     }
     return String(truncateToInteger(v));
   }
@@ -1870,6 +1885,16 @@ function generateTAC(ast, sem, diags) {
     }
 
     if (node.type === 'NODE_IDENTIFIER') {
+      const rec = findAnySymbol(node.identifier);
+      if (rec && rec.is_array) {
+        // array-to-pointer decay: a bare array name in an expression is the
+        // address of its first element (&arr[0]). Array parameters decay
+        // differently: their slot already holds the caller's address.
+        if (rec.isParam) return { place: node.identifier, type: 'ptr', isConst: false };
+        const t = newTemp('ptr');
+        emit('ADDR', t, node.identifier, '0', node.line);
+        return { place: t, type: 'ptr', isConst: false };
+      }
       return { place: node.identifier, type: semExprType(node), isConst: false };
     }
 
@@ -2067,8 +2092,21 @@ function generateTAC(ast, sem, diags) {
     const base = node.children[0];
     const idx = genExpr(node.children[1]);
     const t = newTemp('ptr');
-    const baseName = base.type === 'NODE_IDENTIFIER' ? base.identifier : '0';
-    emit('IDX_ADDR', t, baseName, idx.place, node.line);
+    if (base.type === 'NODE_IDENTIFIER') {
+      const rec = findAnySymbol(base.identifier);
+      if (rec && rec.is_array && !rec.isParam) {
+        // fixed array: bounds-checked IDX_ADDR on the array slot
+        emit('IDX_ADDR', t, base.identifier, idx.place, node.line);
+        return t;
+      }
+      // pointer variable or array parameter: the slot holds an address.
+      // Load its value and index (no bounds check — C pointer semantics).
+      emit('+', t, base.identifier, idx.place, node.line);
+      return t;
+    }
+    // pointer-valued expression: evaluate it, then index
+    const bp = genExpr(base);
+    emit('+', t, bp.place, idx.place, node.line);
     return t;
   }
 
@@ -2082,6 +2120,20 @@ function generateTAC(ast, sem, diags) {
           const f = s.fields.get(node.identifier);
           const t = newTemp('ptr');
           emit('ADDR', t, base.identifier, String(f.offset), node.line);
+          return { place: t, fieldType: f.is_array ? f.type + '*' : f.type };
+        }
+      }
+    }
+    if (base && base.type === 'NODE_MEMBER') {
+      // nested struct member: o.in.a — resolve the base member first, then
+      // add this field's offset relative to the base's struct type
+      const bma = genMemberAddr(base);
+      if (bma && typeof bma.fieldType === 'string' && bma.fieldType.startsWith('struct ')) {
+        const s = sem.structs.get(bma.fieldType.slice(7));
+        if (s && s.fields.has(node.identifier)) {
+          const f = s.fields.get(node.identifier);
+          const t = newTemp('ptr');
+          emit('+', t, bma.place, String(f.offset), node.line);
           return { place: t, fieldType: f.is_array ? f.type + '*' : f.type };
         }
       }
@@ -2215,12 +2267,70 @@ function generateTAC(ast, sem, diags) {
     if (node.is_array) {
       // children[0] = size literal when has_size, rest = initializer values
       const inits = node.has_size ? node.children.slice(1) : node.children.slice(0);
+      const rec = findAnySymbol(node.identifier);
+      const cnt = (rec && rec.is_array) ? rec.size : node.children.length;
+      if (inits.length === 1 && inits[0].type === 'NODE_STRING_LITERAL') {
+        // char s[N] = "literal": copy the characters (and the NUL when it
+        // fits) into the array cells, then zero-fill the remainder.
+        const str = String(inits[0].string_val || '');
+        const n = str.length + 1; // chars + NUL
+        const storeByte = (i, ch) => {
+          const idxT = newTemp('ptr');
+          emit('IDX_ADDR', idxT, node.identifier, String(i), node.line);
+          emit('STORE_PTR', '', idxT, String(ch), node.line);
+        };
+        for (let i = 0; i < n && i < cnt; i++) storeByte(i, i < str.length ? str.charCodeAt(i) : 0);
+        for (let i = n; i < cnt; i++) storeByte(i, 0);
+        return;
+      }
       inits.forEach((initExpr, i) => {
         const v = genExpr(initExpr);
         const idxT = newTemp('ptr');
         emit('IDX_ADDR', idxT, node.identifier, String(i), node.line);
         emit('STORE_PTR', '', idxT, v.place, node.line);
       });
+      // C semantics: the remainder of a partially-initialized aggregate is
+      // zero-filled every time the declaration executes.
+      for (let i = inits.length; i < cnt; i++) {
+        const idxT = newTemp('ptr');
+        emit('IDX_ADDR', idxT, node.identifier, String(i), node.line);
+        emit('STORE_PTR', '', idxT, '0', node.line);
+      }
+      return;
+    }
+    if (node.children.length > 0 && node.type_name && node.type_name.startsWith('struct ')) {
+      // struct initializer list: struct P p = {1, 2}; — store each value at
+      // the flattened leaf offset, zero-fill the remaining fields (C's flat
+      // subobject initialization semantics).
+      const leaves = [];
+      const flatten = (structName, base) => {
+        const s = sem.structs.get(structName);
+        if (!s) return;
+        for (const f of s.fields.values()) {
+          if (typeof f.type === 'string' && f.type.startsWith('struct ')) {
+            if (!f.is_array) flatten(f.type.slice(7), base + f.offset);
+            continue;
+          }
+          if (f.is_array) {
+            for (let k = 0; k < f.size && leaves.length < 1024; k++) leaves.push(base + f.offset + k);
+            continue;
+          }
+          leaves.push(base + f.offset);
+        }
+      };
+      flatten(node.type_name.slice(7), 0);
+      const storeLeaf = (i, valPlace) => {
+        if (i >= leaves.length) return;
+        const t = newTemp('ptr');
+        emit('ADDR', t, node.identifier, String(leaves[i]), node.line);
+        emit('STORE_PTR', '', t, valPlace, node.line);
+      };
+      node.children.forEach((initExpr, i) => {
+        if (i >= leaves.length) return;
+        const v = genExpr(initExpr);
+        storeLeaf(i, v.place);
+      });
+      for (let i = node.children.length; i < leaves.length; i++) storeLeaf(i, '0');
       return;
     }
     if (node.children.length > 0) {
@@ -2621,7 +2731,9 @@ function generateBytecode(optTac, sem, tempTypes, strings) {
     return code[code.length - 1];
   };
 
-  const isNumericPlace = (p) => /^-?\d+$/.test(p) || /^-?\d+\.\d+$/.test(p);
+  // Accepts C numeric literal shapes as emitted by constString, including
+  // scientific notation: [-+]?digits[.digits][eE[+-]digits]
+  const isNumericPlace = (p) => /^-?[0-9]+(\.[0-9]*)?([eE][+-]?[0-9]+)?$/.test(p);
 
   const pushPlace = (place, line) => {
     if (isNumericPlace(place)) {
@@ -2805,6 +2917,141 @@ function generateBytecode(optTac, sem, tempTypes, strings) {
 }
 
 // ---------------------------------------------------------------------------
+// Float formatting helpers (must match the C backend byte-for-byte)
+// ---------------------------------------------------------------------------
+
+// Mirrors C fmt.c format_value: the shortest %g representation that
+// round-trips to the same double (exponent leading zeros stripped).
+function cFormatValue(v) {
+  if (isIntegral(v)) return String(truncateToInteger(v));
+  for (let prec = 1; prec <= 17; prec++) {
+    const s = formatGeneral(v, prec, false).replace(/e([+-])0+(\d+)/, 'e$1$2');
+    if (parseFloat(s) === v) return s;
+  }
+  return String(v);
+}
+
+function exactDecimal(value, decimals) {
+  if (!Number.isFinite(value)) return '0';
+  const buf = new ArrayBuffer(8);
+  const f64 = new Float64Array(buf);
+  const u64 = new BigUint64Array(buf);
+  f64[0] = value;
+  const bits = u64[0];
+  const neg = (bits >> 63n) === 1n;
+  const expBits = Number((bits >> 52n) & 0x7ffn);
+  let mant = bits & ((1n << 52n) - 1n);
+  let e;
+  if (expBits === 0) e = -1074;             // subnormal / zero
+  else { mant |= 1n << 52n; e = expBits - 1075; }
+  // value = mant * 2^e. scaled = value * 10^decimals = mant * 2^(e+decimals) * 5^decimals
+  let num, den = 1n;
+  if (decimals >= 0) {
+    num = mant * (5n ** BigInt(decimals));
+    const shift = e + decimals;
+    if (shift >= 0) num <<= BigInt(shift);
+    else den <<= BigInt(-shift);
+  } else {
+    const D = -decimals;
+    num = mant;
+    const shift = e - D;
+    if (shift >= 0) num <<= BigInt(shift);
+    else den <<= BigInt(-shift);
+    den *= 5n ** BigInt(D);
+  }
+  const q = num / den;
+  const r = num % den;
+  const twice = 2n * r;
+  let rounded = q;
+  if (twice > den) rounded = q + 1n;
+  else if (twice === den && q % 2n === 1n) rounded = q + 1n; // tie -> even
+  // glibc keeps the sign even when a negative value rounds to zero (-0.000)
+  const sign = neg ? '-' : '';
+  let abs = rounded < 0n ? -rounded : rounded;
+  if (rounded === 0n && decimals < 0) return sign + '0';
+  if (decimals < 0) {
+    // rounded is value in units of 10^(-decimals)
+    return sign + abs.toString() + '0'.repeat(-decimals);
+  }
+  let digits = abs.toString();
+  if (digits.length <= decimals) digits = digits.padStart(decimals + 1, '0');
+  if (decimals === 0) return sign + digits;
+  const intPart = digits.slice(0, digits.length - decimals);
+  const fracPart = digits.slice(digits.length - decimals);
+  return sign + intPart + '.' + fracPart;
+}
+
+function formatFixed(v, prec) {
+  return exactDecimal(v, prec);
+}
+
+// %e / %E: d.dddde±XX (exponent at least two digits, like C)
+function formatExponent(v, prec, upper) {
+  if (v === 0 || Object.is(v, -0)) {
+    const s = (Object.is(v, -0) ? '-' : '') + '0.' + '0'.repeat(prec) + 'e+00';
+    return upper ? s.toUpperCase() : s;
+  }
+  const neg = v < 0 || Object.is(v, -0);
+  const av = Math.abs(v);
+  let X = Math.floor(Math.log10(av));
+  if (av / 10 ** X >= 10) X++;
+  if (av / 10 ** X < 1) X--;
+  let mant = av / 10 ** X;
+  let body = exactDecimal(mant, prec);
+  if (body.split('.')[0].length > 1) { // e.g. "10.000000" after rounding up
+    X++;
+    mant = av / 10 ** X;
+    body = exactDecimal(mant, prec);
+  }
+  const expSign = X < 0 ? '-' : '+';
+  const expStr = String(Math.abs(X)).padStart(2, '0');
+  const out = (neg ? '-' : '') + body + 'e' + expSign + expStr;
+  return upper ? out.toUpperCase() : out;
+}
+
+// %g / %G: precision significant digits; %e style when the exponent is
+// < -4 or >= precision; trailing zeros stripped (matches C semantics).
+function formatGeneral(v, prec, upper) {
+  let p = prec === -1 ? 6 : prec;
+  if (p === 0) p = 1;
+  if (v === 0 || Object.is(v, -0)) {
+    const s = (Object.is(v, -0) ? '-' : '') + '0';
+    return upper ? s.toUpperCase() : s;
+  }
+  const neg = v < 0 || Object.is(v, -0);
+  const av = Math.abs(v);
+  let X = Math.floor(Math.log10(av));
+  if (av / 10 ** X >= 10) X++;
+  if (av / 10 ** X < 1) X--;
+  let body;
+  if (X < -4 || X >= p) {
+    // e-style with p-1 fractional digits
+    let mant = av / 10 ** X;
+    body = exactDecimal(mant, p - 1);
+    if (body.split('.')[0].length > 1) {
+      X++;
+      mant = av / 10 ** X;
+      body = exactDecimal(mant, p - 1);
+    }
+    body = body.replace(/0+$/, '');
+    if (body.endsWith('.')) body = body.slice(0, -1);
+    const expSign = X < 0 ? '-' : '+';
+    body += 'e' + expSign + String(Math.abs(X)).padStart(2, '0');
+  } else {
+    // f-style with p-1-X fractional digits
+    const frac = Math.max(p - 1 - X, 0);
+    body = exactDecimal(av, frac);
+    body = body.replace(/0+$/, '');
+    if (body.endsWith('.')) body = body.slice(0, -1);
+  }
+  const out = (neg ? '-' : '') + body;
+  return upper ? out.toUpperCase() : out;
+}
+
+// Next scanf conversion spec in fmt starting at position `start`.
+// Returns { ch, pos }; literal text and %% are skipped (ch === 0 at end).
+
+// ---------------------------------------------------------------------------
 // Phase 7: Stack Virtual Machine
 // ---------------------------------------------------------------------------
 
@@ -2850,7 +3097,7 @@ function runVirtualMachine(chunk, sem, inputs) {
     halted = true;
   }
 
-  const fmtNumber = (v) => (isIntegral(v) ? String(truncateToInteger(v)) : String(v));
+  const fmtNumber = (v) => cFormatValue(v);
 
   // deterministic PRNG state (glibc-style LCG), identical in the C backend
   let randState = 1;
@@ -2942,6 +3189,30 @@ function runVirtualMachine(chunk, sem, inputs) {
     return t;
   };
 
+  // Exact decimal expansion of a finite double, correctly rounded to
+  // `decimals` places with round-half-to-even — matching glibc printf (the
+  // native backend uses snprintf, so this must agree byte-for-byte).
+  // `decimals` may be negative (round to a multiple of 10^-decimals).
+  function nextScanfConv(fmt, start) {
+    let i = start;
+    const n = fmt.length;
+    while (i < n) {
+      if (fmt[i] !== '%') { i++; continue; }
+      i++;
+      if (i < n && fmt[i] === '%') { i++; continue; }
+      while (i < n && '-+ #0'.includes(fmt[i])) i++;
+      while (i < n && /[0-9]/.test(fmt[i])) i++;
+      if (i < n && fmt[i] === '.') {
+        i++;
+        while (i < n && /[0-9]/.test(fmt[i])) i++;
+      }
+      while (i < n && 'lhztj'.includes(fmt[i])) i++;
+      if (i < n) return { ch: fmt[i], pos: i + 1 };
+      return { ch: 0, pos: i };
+    }
+    return { ch: 0, pos: i };
+  }
+
   function formatPrintf(fmt, args) {
     let out = '';
     let ai = 0;
@@ -2978,11 +3249,11 @@ function runVirtualMachine(chunk, sem, inputs) {
       } else if (conv === 'p') {
         out += '0x' + toUnsigned32(num).toString(16);
       } else if (conv === 'f') {
-        out += num.toFixed(prec === -1 ? 6 : prec);
+        out += formatFixed(num, prec === -1 ? 6 : prec);
       } else if (conv === 'e' || conv === 'E') {
-        out += num.toExponential(prec === -1 ? 6 : prec);
+        out += formatExponent(num, prec === -1 ? 6 : prec, conv === 'E');
       } else if (conv === 'g' || conv === 'G') {
-        out += String(num);
+        out += formatGeneral(num, prec === -1 ? 6 : prec, conv === 'G');
       } else if (conv === 'c') {
         out += String.fromCharCode(truncateToInteger(num) & 0xff);
       } else if (conv === 's') {
@@ -3203,14 +3474,30 @@ function runVirtualMachine(chunk, sem, inputs) {
         }
         const addrs = stack.splice(stack.length - nTargets, nTargets);
         const fmt = strings[instr.fmtIdx] || '%d';
+        let fpos = 0;
         for (let i = 0; i < nTargets; i++) {
+          const conv = nextScanfConv(fmt, fpos);
+          fpos = conv.pos;
           const raw = String(inputs[inputIdx++]).trim();
-          let val = parseFloat(raw);
-          if (Number.isNaN(val)) val = 0;
-          if (fmt.includes('%d') && i === 0) val = truncateToInteger(val);
           const addr = truncateToInteger(addrs[i].n || 0);
           if (addr < 0 || addr >= memTop) { runtimeError(`Invalid scanf target address ${addr}`, instr.line); break; }
-          mem[addr] = val;
+          if (conv.ch === 'c') {
+            // %c reads the first character of the next input line
+            mem[addr] = raw ? raw.charCodeAt(0) : 0;
+          } else if (conv.ch === 's') {
+            // %s copies the input token (the line, trimmed) plus NUL
+            let cap = memTop - addr;
+            if (cap > 4096) cap = 4096;
+            if (cap < 1) cap = 1;
+            let k = 0;
+            while (k < raw.length && k < cap - 1) { mem[addr + k] = raw.charCodeAt(k); k++; }
+            mem[addr + k] = 0;
+          } else {
+            let val = parseFloat(raw);
+            if (Number.isNaN(val)) val = 0;
+            if (['d', 'i', 'u', 'x', 'X', 'o'].includes(conv.ch)) val = truncateToInteger(val);
+            mem[addr] = val;
+          }
         }
         pc++;
         break;

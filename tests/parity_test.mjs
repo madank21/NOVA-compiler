@@ -106,6 +106,28 @@ const CORPUS = [
   { name: 'scan_one', code: 'int main() { int n; scanf("%d", &n); printf("got %d\\n", n); return 0; }', inputs: ['42'] },
   { name: 'scan_two', code: 'int main() { int a, b; scanf("%d", &a); scanf("%d", &b); printf("%d\\n", a + b); return 0; }', inputs: ['3', '4'] },
   { name: 'scan_wait', code: 'int main() { int n; scanf("%d", &n); printf("%d\\n", n); return 0; }', inputs: [] },
+  // char arrays: string-literal init, decay to pointer for %s, unsized arrays
+  { name: 'char_string', code: 'int main() { char s[6] = "hello"; s[0] = \'H\'; s[4] = \'!\'; printf("%s %c %c\\n", s, s[1], s[4]); return 0; }' },
+  { name: 'char_string_unsized', code: 'int main() { char s[] = "hello"; printf("%s %d\\n", s, s[4]); return 0; }' },
+  { name: 'char_string_padded', code: 'int main() { char s[10] = "hi"; printf("%s %d %d %d\\n", s, s[2], s[3], s[4]); return 0; }' },
+  // array parameters (int arr[]) and pointer indexing (p[i])
+  { name: 'array_param', code: 'int find(int arr[], int n, int target) { for (int i = 0; i < n; i = i + 1) { if (arr[i] == target) return i; } return -1; }\nint main() { int a[5] = {3, 1, 4, 1, 5}; printf("%d %d %d\\n", find(a, 5, 4), find(a, 5, 9), find(a, 5, 5)); return 0; }' },
+  { name: 'pointer_index', code: 'int main() { int a[3] = {10, 20, 30}; int *p = a; printf("%d %d %d\\n", p[0], p[1], p[2]); return 0; }' },
+  // partial array initializers zero-fill the remainder on every execution
+  { name: 'partial_init', code: 'int f(int k) { int a[4] = {1, 2}; if (k == 1) a[2] = 99; return a[2]; }\nint main() { printf("%d %d\\n", f(1), f(0)); return 0; }' },
+  // scanf %c and %s (one input line per conversion)
+  { name: 'scan_mixed', code: 'int main() { int n; float f; char c; char s[10]; scanf("%d %f %c %s", &n, &f, &c, s); printf("%d %.1f %c %s\\n", n, f, c, s); return 0; }', inputs: ['42', '3.5', 'x', 'hello'] },
+  { name: 'scan_str', code: 'int main() { char s[10]; scanf("%s", s); printf("%s\\n", s); return 0; }', inputs: ['hello'] },
+  // float formatting: half-to-even rounding, %g/%e semantics
+  { name: 'fmt_ties', code: 'int main() { printf("%.0f %.0f %.0f\\n", 2.5, 3.5, 2.25); printf("%.1f %.1f %.1f\\n", 2.25, 2.75, 1.15); return 0; }' },
+  { name: 'fmt_general', code: 'int main() { printf("%g %g %g %G %g\\n", 0.1, 1e20, 1234567.0, 1234567.0, 100.0); return 0; }' },
+  { name: 'fmt_exponent', code: 'int main() { printf("%e %E\\n", 0.0001, 12345.678); return 0; }' },
+  // scientific-notation literals survive constant folding and %f
+  { name: 'sci_literal', code: 'int main() { double a = 1e20; double b = 1.5e-3; printf("%f %.6f\\n", a, b); return 0; }' },
+  // nested struct fields and struct initializer lists
+  { name: 'nested_struct', code: 'struct Inner { int a; int b; };\nstruct Outer { struct Inner in; int c; };\nint main() { struct Outer o; o.in.a = 1; o.in.b = 2; o.c = 3; printf("%d %d %d\\n", o.in.a, o.in.b, o.c); return 0; }' },
+  { name: 'struct_init', code: 'struct P { int x; int y; };\nstruct P g = {7, 9};\nint main() { struct P p = {5, 6}; struct P q = {1}; printf("%d %d %d %d %d %d\\n", g.x, g.y, p.x, p.y, q.x, q.y); return 0; }' },
+  { name: 'struct_nested_init', code: 'struct A { int x; };\nstruct B { struct A a; int y; };\nstruct C { struct B b; int z; };\nint main() { struct C c2 = {6, 7, 8}; struct B b2 = {4, 5}; printf("%d %d %d %d %d\\n", c2.b.a.x, c2.b.y, c2.z, b2.a.x, b2.y); return 0; }' },
   // invalid programs — both engines must reject identically
   { name: 'bad_empty', code: '' },
   { name: 'bad_no_main', code: 'int foo() { return 1; }' },

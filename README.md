@@ -43,14 +43,14 @@ by default; override with `NOVA_HOST` / `NOVA_PORT`.
 |---|---|
 | `npm run test:engine` | 539 assertions on the browser engine (node, zero deps) |
 | `npm run test:c-backend` | 111 assertions on the native backend (`make check`) |
-| `npm run test:parity` | Deep-compares JS vs C JSON across 47 programs |
+| `npm run test:parity` | Deep-compares JS vs C JSON across 63 programs |
 | `npm test` | engine + parity |
 | `npm run test:all` | engine + native + parity |
 
 The parity test is the key guarantee: for every program it compiles with both
 engines and deep-compares the full result (tokens, AST, symbol table, TAC,
 optimized TAC, metrics, bytecode, VM trace, console output, diagnostics). It
-currently reports **720 fields compared, 0 mismatches**.
+currently reports **945 fields compared, 0 mismatches**.
 
 The native backend also builds clean under AddressSanitizer + UBSan
 (`cd c_backend && make asan && ./nova_native_test`).

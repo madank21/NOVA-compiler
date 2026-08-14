@@ -378,3 +378,76 @@ Current state: `tests/run_engine_test.mjs` (16 cases, 2 failing, several asserti
 
 ### Bottom line
 The project's *presentation layer* is ahead of its *compiler substance*: six polished panels visualize data that, on inspection, is frequently simulated, miscompiled, or schema-incompatible between the two engines, and the native backend does not even build. The architecture itself (phase modules + JSON contract + visualizers + dual engines) is worth keeping. Execute Phase 1 — ideally converging on a single C implementation compiled to WASM for the browser — and NOVA can honestly claim deterministic, accurate compilation; until then the "compiler" label is generous.
+
+---
+
+## Addendum — accuracy hardening pass (2026-08-14)
+
+Follow-up audit on branch `arena/019fffc8-nova-compiler` (base `cdc2602`).
+Scope: execute the bundled GCC stress test (`tests/corpus/stress_test.c`),
+then fuzz the compiler with simple programs and compare every console output
+against real `gcc`. The stress test itself had 4 real defects (below); the
+compiler had 9 accuracy gaps found by the comparison battery. All fixed in
+**both** engines (JS and C99 mirror) and locked in by 13 new parity corpus
+programs.
+
+### Stress test fixes (`tests/corpus/stress_test.c`)
+
+| # | Defect | Fix |
+|---|---|---|
+| 1 | `VECTOR_OP` macro used as an expression but expands to statements (`int result = VECTOR_OP(...)` fails to compile) | Rewrote as a GNU statement-expression `({ ... })` with unique locals |
+| 2 | `int (^block)(int) = ^...` is Clang block syntax, not GCC | Replaced with a GCC nested function |
+| 3 | Missing includes: `offsetof` needs `<stddef.h>`, `double complex`/`I` need `<complex.h>`, `errno` needs `<errno.h>` | Added includes (also moved `<signal.h>`/`<stdatomic.h>` to the top) |
+| 4 | `setbuf(stdout, buffer)` with a function-local buffer → dangling pointer, **segfault at Test 10** | Made the buffer `static` |
+| 5 | `fread` into uninitialized `read_buf` → `%s` may print garbage | Zero-initialized the buffer |
+| 6 | Misleading "(should be 1.1)" comments on the float-accumulation lines | Clarified: 11 × 0.1f accumulated in float/double |
+
+Verified: compiles cleanly with `gcc -std=gnu11 -O2 -Wall -Wextra`, runs all
+12 suites, exit code 0. Every printed value was hand-checked; the two float
+sums were reproduced bit-exactly in exact rational arithmetic
+(`1.10000014305114746094` / `1.09999999999999986677`).
+
+### Compiler gaps found and fixed (both engines)
+
+| # | Symptom (simple program) | Root cause | Fix |
+|---|---|---|---|
+| 1 | `printf("%s", s)` on a hand-built `char` array printed garbage/empty | No array-to-pointer decay: `LOAD arr` pushed the *value of element 0* | Bare array identifiers decay to `&arr[0]` (`ADDR`); array params decay to the stored address |
+| 2 | `char s[6] = "hello"` produced garbage | String-literal array init stored the string-pool *reference* into element 0 | Char-by-char copy (+NUL) into the array cells |
+| 3 | `char s[] = "hello"` sized 1 → out-of-bounds at `s[4]` | Unsized-array inference counted 1 initializer child | `strlen+1` size for string-literal initializers |
+| 4 | `int a[4] = {1,2}` in a re-entered function returned stale values (`99 99` vs gcc `99 0`) | Partial initializers never zero-filled the remainder | Explicit zero-fill of the remainder on every execution |
+| 5 | `int find(int arr[], ...)` rejected | Array parameters unsupported | Parser/semantic/codegen support; indexing loads the address then adds the index |
+| 6 | `p[1]` on `int *p = a` read `slot+1` instead of `a[1]` (`10 11 12` vs `10 20 30`) | Pointer indexing treated the pointer slot as the array base | Pointer/array-param indexing: load address, add index (no bounds check) |
+| 7 | `scanf("%d %f %c %s", …)` silently wrote 0 for `%c`/`%s` | scanf parsed every line as a number | Per-conversion parsing: `%c` = first char of line, `%s` = line + NUL, numerics as before |
+| 8 | `printf("%g", 1e20)` → `0`; `%.0f` of `2.5` differed between engines | `is_numeric_place` rejected scientific notation (`1e+20` treated as an identifier → `LOAD slot 0`); JS `toFixed` rounds ties away from zero (C: half-to-even); JS `%e`/`%g` didn't match C | Numeric-place regex accepts exponents; JS `%f`/`%e`/`%g` rewritten with exact BigInt decimal expansion, round-half-to-even, exponent zero-padding; C `%g` now uses real `snprintf` semantics |
+| 9 | `char s[10]` sized 16 in the JS engine | `parseInt(sz.lexeme, 16)` — array sizes parsed as **hex** | `parseInt(..., 10)` (also for struct fields) |
+
+Additional latent parity bug found while locking these in: JS `constString` /
+trace `fmtNumber` used `String(v)` for large non-integral doubles while the C
+backend emits shortest round-tripping `%g` (`1e20` vs `100000000000000000000`).
+Unified through a shared `cFormatValue` helper.
+
+### Follow-up struct gap (same session)
+
+While probing simple programs, two more struct gaps surfaced and were fixed in
+both engines:
+
+| # | Symptom | Root cause | Fix |
+|---|---|---|---|
+| 10 | `struct Outer { struct Inner in; }` rejected ("struct fields are not supported"); `o.in.a` failed | Parser rejected `struct`-typed fields; member-address codegen only handled `id.field` | Parser accepts `struct` fields; `gen_member_addr` recurses through `NODE_MEMBER` bases |
+| 11 | `struct P g = {7, 9};` (global) and local struct initializer lists were parse errors; nested flat init `{6,7,8}` stored to wrong offsets | Only arrays accepted `{...}` initializers; offsets were top-level only | Struct initializer lists with C's flat subobject mapping (leaf-offset flattening) + zero-fill of remaining leaves |
+
+New parity corpus programs: `nested_struct`, `struct_init`, `struct_nested_init`.
+
+### Verification
+
+| Check | Result |
+|---|---|
+| `npm run test:engine` | 539 passed, 0 failed |
+| `cd c_backend && make check` | 111 passed, 0 failed |
+| `make asan && ./nova_native_test` | 111 passed, 0 failed |
+| `npm run test:parity` | **945 fields compared, 0 mismatches** (63 programs, 16 new) |
+| 31-program GCC comparison battery | 31/31 JS↔native parity; 30/31 match `gcc` byte-for-byte (the 1 remainder is the documented float32-rounding limitation: NOVA stores all floats as doubles) |
+
+Known limitation (documented in `docs/SCHEMA.md`): there is no float32
+precision — `float` variables behave as `double`, so constants that need
+float32 rounding (`float c = 3.14e10;`) keep the full double value.

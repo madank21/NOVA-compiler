@@ -185,7 +185,7 @@ SemResult *nova_semantic(NovaNode *ast, DiagList *diags) {
             fld->is_array = fn->is_array;
             fld->size = fn->is_array
                 ? (fn->has_size ? (truncate_ll(fn->children[0]->num_val) > 1 ? (int)truncate_ll(fn->children[0]->num_val) : 1) : 1)
-                : 1;
+                : type_size(s, fn->type_name);
             fld->offset = offset;
             offset += fld->size;
         }
@@ -237,7 +237,9 @@ SemResult *nova_semantic(NovaNode *ast, DiagList *diags) {
                 }
                 int size = node->is_array
                     ? (node->has_size ? (truncate_ll(node->children[0]->num_val) > 1 ? (int)truncate_ll(node->children[0]->num_val) : 1)
-                       : (node->child_count > 1 ? node->child_count : 1))
+                       : (node->child_count > 1 ? node->child_count
+                          : (node->child_count == 1 && node->children[0]->type == NODE_STRING_LITERAL
+                             ? (int)strlen(node->children[0]->string_val) + 1 : 1)))
                     : type_size(s, node->type_name);
                 SymRec *rec = recrec_add(&s->globals);
                 strncpy(rec->name, node->identifier, sizeof(rec->name) - 1);
@@ -268,6 +270,7 @@ SemResult *nova_semantic(NovaNode *ast, DiagList *diags) {
             strncpy(rec->name, pn->identifier, sizeof(rec->name) - 1);
             strncpy(rec->type, pn->type_name, sizeof(rec->type) - 1);
             rec->size = 1;
+            rec->is_array = pn->is_array;
             rec->isParam = 1;
             rec->offset = f->frame_size;
             f->frame_size += 1;
@@ -339,7 +342,9 @@ static void sem_declare_local(SemResult *ss, FuncDef *ff, DiagList *diags, NovaN
     scope_push_name(scope, node->identifier);
     int size = node->is_array
         ? (node->has_size ? (truncate_ll(node->children[0]->num_val) > 1 ? (int)truncate_ll(node->children[0]->num_val) : 1)
-           : (node->child_count > 1 ? node->child_count : 1))
+           : (node->child_count > 1 ? node->child_count
+              : (node->child_count == 1 && node->children[0]->type == NODE_STRING_LITERAL
+                 ? (int)strlen(node->children[0]->string_val) + 1 : 1)))
         : type_size(ss, node->type_name);
     if (node->is_static) {
         if (sem_find_global(ss, node->identifier)) {
