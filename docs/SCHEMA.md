@@ -176,3 +176,33 @@ with constant initializers. Preprocessor directives are skipped (`#include`,
 `#define`). Not supported (diagnostics will say so): ternary `?:`, `switch`,
 `do/while`, pointer arithmetic beyond indexing, dynamic memory, multi-declarator
 initializers with mixed array/scalar forms.
+
+### Semantics notes (v1, enforced by the parity suite)
+
+- **Array-to-pointer decay.** A bare array name in an expression is the address
+  of its first element (`&arr[0]`), exactly like C. This makes `printf("%s",
+  s)` on a `char` array, `int *p = a;`, and passing arrays to functions work.
+- **Array parameters.** `int arr[]` (and `int arr[5]`) parameter declarations
+  are accepted; the parameter holds the caller's address. Indexing an array
+  parameter or a pointer (`p[i]`) performs address arithmetic without bounds
+  checking (C pointer semantics); fixed arrays keep runtime bounds checks.
+  Addresses are plain numbers, so `p + k` / `p - k` also work with numeric
+  (unit-element) semantics.
+- **String-literal array initializers.** `char s[6] = "hello"` (and unsized
+  `char s[] = "hello"`, sized `strlen+1`) copies the characters plus NUL into
+  the array cells. Partial initializer lists (`int a[4] = {1, 2}`) zero-fill
+  the remainder every time the declaration executes (C semantics).
+- **Structs nest and initialize.** Struct-typed fields (`struct Inner in;`),
+  member chains (`o.in.a`), and initializer lists for globals and locals
+  (`struct P g = {7, 9};`) are supported with C's flat subobject mapping:
+  `struct C c = {6, 7, 8}` fills the innermost fields first. Partial struct
+  initializer lists zero-fill the remaining leaves.
+- **Types are stored as doubles.** `char`/`float` normalize to `int`/`double`;
+  there is no float32 rounding of constants or arithmetic (a documented
+  limitation — e.g. `float` literals like `3.14e10` are not rounded to float32).
+- **Scientific notation** (`1e20`, `1.5e-3`) is supported in literals.
+- **printf rounding matches C** (`glibc`): `%f`/`%e` round half-to-even on the
+  exact binary value, `%g`/`%G` use C's precision-significant-digit rules with
+  trailing zeros stripped, and exponents are zero-padded to two digits.
+- **scanf conversions** consume one input line each; `%c` takes the line's
+  first character, `%s` copies the line (plus NUL) into the target address.

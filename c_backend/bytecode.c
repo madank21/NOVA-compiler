@@ -20,15 +20,25 @@ typedef struct {
 } BG;
 
 static int is_numeric_place(const char *p) {
+    /* Accepts C numeric literal shapes as emitted by fmt.c, including
+     * scientific notation: [-+]?digits[.digits][eE[+-]digits] */
     if (!p || !*p) return 0;
-    int i = (p[0] == '-') ? 1 : 0;
-    int digits = 0, dots = 0;
-    for (; p[i]; i++) {
-        if (isdigit((unsigned char)p[i])) digits++;
-        else if (p[i] == '.' && dots == 0) dots++;
-        else return 0;
+    const char *s = p;
+    if (*s == '-' || *s == '+') s++;
+    int digits = 0;
+    while (isdigit((unsigned char)*s)) { digits++; s++; }
+    if (*s == '.') {
+        s++;
+        while (isdigit((unsigned char)*s)) { digits++; s++; }
     }
-    return digits > 0;
+    if (*s == 'e' || *s == 'E') {
+        s++;
+        if (*s == '+' || *s == '-') s++;
+        int ed = 0;
+        while (isdigit((unsigned char)*s)) { ed++; s++; }
+        if (!ed) return 0;
+    }
+    return digits > 0 && *s == '\0';
 }
 
 static BcInstr *emit_instr(BG *bg, const char *op, double operand, const char *symbol, int line) {

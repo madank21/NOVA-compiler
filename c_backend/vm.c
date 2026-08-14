@@ -88,7 +88,6 @@ static unsigned long long to_unsigned32(double v) {
 
 static void format_printf(VM *vm, const char *fmt, Cell *args, int nargs) {
     char out[1024];
-    char numbuf[64];
     int ai = 0;
     size_t flen = strlen(fmt);
     for (size_t i = 0; i < flen; i++) {
@@ -137,8 +136,10 @@ static void format_printf(VM *vm, const char *fmt, Cell *args, int nargs) {
             snprintf(out, sizeof(out), conv == 'e' ? "%.*e" : "%.*E", prec == -1 ? 6 : prec, num);
             console_append(vm, out);
         } else if (conv == 'g' || conv == 'G') {
-            fmt_number(num, numbuf, sizeof(numbuf));
-            console_append(vm, numbuf);
+            /* real C %g semantics (precision significant digits, %e style when
+             * the exponent is < -4 or >= precision, trailing zeros stripped) */
+            snprintf(out, sizeof(out), conv == 'g' ? "%.*g" : "%.*G", prec == -1 ? 6 : prec, num);
+            console_append(vm, out);
         } else if (conv == 'c') {
             char one[2] = { (char)(truncate_ll(num) & 0xff), '\0' };
             console_append(vm, one);
@@ -159,6 +160,28 @@ static void format_printf(VM *vm, const char *fmt, Cell *args, int nargs) {
             console_append(vm, one);
         }
     }
+}
+
+/* Return the next scanf conversion spec in fmt (advancing *pi past it).
+ * Literal text and %% are skipped; returns 0 when no more conversions. */
+static char scanf_next_conv(const char *fmt, int *pi) {
+    size_t n = strlen(fmt);
+    while (*pi < (int)n) {
+        char ch = fmt[*pi];
+        if (ch != '%') { (*pi)++; continue; }
+        (*pi)++;
+        if (*pi < (int)n && fmt[*pi] == '%') { (*pi)++; continue; } /* %% */
+        while (*pi < (int)n && strchr("-+ #0", fmt[*pi])) (*pi)++;
+        while (*pi < (int)n && isdigit((unsigned char)fmt[*pi])) (*pi)++;
+        if (*pi < (int)n && fmt[*pi] == '.') {
+            (*pi)++;
+            while (*pi < (int)n && isdigit((unsigned char)fmt[*pi])) (*pi)++;
+        }
+        while (*pi < (int)n && strchr("lhztj", fmt[*pi])) (*pi)++;
+        if (*pi < (int)n) { char c = fmt[*pi]; (*pi)++; return c; }
+        return 0;
+    }
+    return 0;
 }
 
 /* ------------------------------- builtins -------------------------------- */
@@ -526,23 +549,39 @@ VMResult *nova_vm_run(BcResult *bc, SemResult *sem, const char **inputs, int inp
             for (int i = 0; i < na; i++) addrs[i] = vm.stack[vm.sp - nTargets + i];
             vm.sp -= nTargets;
             const char *fmt = (instr->fmtIdx >= 0 && instr->fmtIdx < bc->string_count) ? bc->strings[instr->fmtIdx] : "%d";
+            int fpos = 0;
             for (int i = 0; i < na; i++) {
+                char conv = scanf_next_conv(fmt, &fpos);
                 const char *raw = vm.inputs[vm.inputIdx++];
-                char buf[256];
-                strncpy(buf, raw, sizeof(buf) - 1); buf[sizeof(buf) - 1] = '\0';
-                /* trim */
-                char *s = buf; while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r') s++;
-                char *endp = NULL;
-                double val = strtod(s, &endp);
-                if (endp == s) val = 0;
-                if (strstr(fmt, "%d") && i == 0) val = (double)truncate_ll(val);
                 long long addr = truncate_ll(addrs[i].n);
                 if (addr < 0 || addr >= memTop) {
                     char m[128]; snprintf(m, sizeof(m), "Invalid scanf target address %lld", addr);
                     vm_runtime_error(&vm, m, instr->line);
                     break;
                 }
-                vm.mem[addr] = val;
+                char buf[256];
+                strncpy(buf, raw, sizeof(buf) - 1); buf[sizeof(buf) - 1] = '\0';
+                /* trim leading whitespace */
+                char *s = buf; while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r') s++;
+                if (conv == 'c') {
+                    /* %c reads the first character of the next input line */
+                    vm.mem[addr] = *s ? (double)(unsigned char)*s : 0.0;
+                } else if (conv == 's') {
+                    /* %s copies the input token (the line, trimmed) plus NUL */
+                    long long cap = memTop - addr;
+                    if (cap > 4096) cap = 4096;
+                    if (cap < 1) cap = 1;
+                    long long k = 0;
+                    while (s[k] && k < cap - 1) { vm.mem[addr + k] = (double)(unsigned char)s[k]; k++; }
+                    vm.mem[addr + k] = 0;
+                } else {
+                    char *endp = NULL;
+                    double val = strtod(s, &endp);
+                    if (endp == s) val = 0;
+                    if (conv == 'd' || conv == 'i' || conv == 'u' || conv == 'x' || conv == 'X' || conv == 'o')
+                        val = (double)truncate_ll(val);
+                    vm.mem[addr] = val;
+                }
             }
             if (vm.halted) break;
             pc++;

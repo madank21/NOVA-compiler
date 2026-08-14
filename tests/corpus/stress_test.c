@@ -7,6 +7,11 @@
 #include <time.h>
 #include <math.h>
 #include <ctype.h>
+#include <stddef.h>   /* offsetof */
+#include <complex.h>  /* double complex, I, creal, cimag */
+#include <errno.h>    /* errno */
+#include <signal.h>   /* signal handler example */
+#include <stdatomic.h>/* atomic_int, atomic_fetch_add, atomic_load */
 
 /* ============================================
    COMPLEX PREPROCESSOR MACROS
@@ -18,12 +23,14 @@
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define FOREACH(i, n) for(int i = 0; i < (n); i++)
 #define VECTOR_OP(type, op, ...) \
-    type result = 0; \
-    type args[] = {__VA_ARGS__}; \
-    for(int i = 0; i < sizeof(args)/sizeof(type); i++) { \
-        result op##= args[i]; \
-    } \
-    result
+    ({ \
+        type _result = 0; \
+        type _args[] = {__VA_ARGS__}; \
+        for(int _i = 0; _i < sizeof(_args)/sizeof(type); _i++) { \
+            _result op##= _args[_i]; \
+        } \
+        _result; \
+    })
 
 #define COMPLEX_MACRO(x, y) \
     ({ \
@@ -120,8 +127,8 @@ void test_arithmetic_advanced() {
         f += 0.1f;
         d += 0.1;
     }
-    printf("Float sum (should be 1.1): %.20f\n", f);
-    printf("Double sum (should be 1.1): %.20f\n", d);
+    printf("Float sum (11 x 0.1f accumulated in float): %.20f\n", f);
+    printf("Double sum (11 x 0.1 accumulated in double): %.20f\n", d);
     
     /* Bitwise operations */
     int a = 0x55, b = 0xAA;
@@ -353,8 +360,8 @@ void test_recursion_variadic() {
     
     // Lambda-like function with GCC nested functions
     #ifdef __GNUC__
-    int (^block)(int) = ^(int x) { return x * x; };
-    printf("Block (GCC extension): %d\n", block(5));
+    int square(int x) { return x * x; }
+    printf("Nested function (GCC extension): %d\n", square(5));
     #endif
 }
 
@@ -525,16 +532,17 @@ void test_io_advanced() {
     if(temp) {
         fprintf(temp, "Hello temporary file!");
         fseek(temp, 0, SEEK_SET);
-        char read_buf[100];
+        char read_buf[100] = {0};
         fread(read_buf, 1, sizeof(read_buf), temp);
         printf("Temporary file content: %s\n", read_buf);
         fclose(temp);
     }
     
     /* Buffered vs unbuffered */
+    static char io_buffer[256];  /* must outlive this function: setbuf keeps the pointer */
     setbuf(stdout, NULL);
     printf("Unbuffered output\n");
-    setbuf(stdout, buffer);
+    setbuf(stdout, io_buffer);
     printf("Buffered output\n");
     fflush(stdout);
 }
@@ -585,8 +593,7 @@ void test_error_handling() {
     }
     
     /* Signal handling (basic) */
-    #include <signal.h>
-    void sig_handler(int sig) {
+    __attribute__((unused)) void sig_handler(int sig) {
         printf("Caught signal: %d\n", sig);
         // Exit gracefully
         exit(1);

@@ -105,10 +105,25 @@ static void gen_index_addr(G *g, NovaNode *node, char out[32]) {
     char t[32];
     new_temp(g, "ptr", t);
     char baseName[64];
-    if (base->type == NODE_IDENTIFIER) strncpy(baseName, base->identifier, 63);
-    else strcpy(baseName, "0");
-    baseName[63] = '\0';
-    emit(g, "IDX_ADDR", t, baseName, idx.place, node->line);
+    if (base->type == NODE_IDENTIFIER) {
+        SymRec *rec = find_any_symbol(g, base->identifier);
+        if (rec && rec->is_array && !rec->isParam) {
+            /* fixed array: bounds-checked IDX_ADDR on the array slot */
+            strncpy(baseName, base->identifier, 63);
+            baseName[63] = '\0';
+            emit(g, "IDX_ADDR", t, baseName, idx.place, node->line);
+            strcpy(out, t);
+            return;
+        }
+        /* pointer variable or array parameter: the slot holds an address.
+         * Load its value and index (no bounds check — C pointer semantics). */
+        emit(g, "+", t, base->identifier, idx.place, node->line);
+        strcpy(out, t);
+        return;
+    }
+    /* pointer-valued expression: evaluate it, then index */
+    Place bp = gen_expr(g, base);
+    emit(g, "+", t, bp.place, idx.place, node->line);
     strcpy(out, t);
 }
 
@@ -129,6 +144,30 @@ static MemberAddr gen_member_addr(G *g, NovaNode *node) {
                         char off[32];
                         snprintf(off, sizeof(off), "%d", st->fields[i].offset);
                         emit(g, "ADDR", t, base->identifier, off, node->line);
+                        strcpy(ma.place, t);
+                        if (st->fields[i].is_array) snprintf(ma.fieldType, sizeof(ma.fieldType), "%s*", st->fields[i].type);
+                        else strncpy(ma.fieldType, st->fields[i].type, sizeof(ma.fieldType) - 1);
+                        ma.ok = 1;
+                        return ma;
+                    }
+                }
+            }
+        }
+    }
+    if (base && base->type == NODE_MEMBER) {
+        /* nested struct member: o.in.a — resolve the base member first, then
+         * add this field's offset relative to the base's struct type */
+        MemberAddr bma = gen_member_addr(g, base);
+        if (bma.ok && strncmp(bma.fieldType, "struct ", 7) == 0) {
+            StructDef *st = sem_find_struct(g->sem, bma.fieldType + 7);
+            if (st) {
+                for (int i = 0; i < st->field_count; i++) {
+                    if (strcmp(st->fields[i].name, node->identifier) == 0) {
+                        char t[32];
+                        new_temp(g, "ptr", t);
+                        char off[32];
+                        snprintf(off, sizeof(off), "%d", st->fields[i].offset);
+                        emit(g, "+", t, bma.place, off, node->line);
                         strcpy(ma.place, t);
                         if (st->fields[i].is_array) snprintf(ma.fieldType, sizeof(ma.fieldType), "%s*", st->fields[i].type);
                         else strncpy(ma.fieldType, st->fields[i].type, sizeof(ma.fieldType) - 1);
@@ -311,6 +350,22 @@ static Place gen_expr(G *g, NovaNode *node) {
         return p;
     }
     if (node->type == NODE_IDENTIFIER) {
+        SymRec *rec = find_any_symbol(g, node->identifier);
+        if (rec && rec->is_array) {
+            /* array-to-pointer decay: a bare array name in an expression is the
+             * address of its first element (&arr[0]). Array parameters decay
+             * differently: their slot already holds the caller's address. */
+            if (rec->isParam) {
+                Place p; memset(&p, 0, sizeof(p));
+                strncpy(p.place, node->identifier, sizeof(p.place) - 1);
+                strcpy(p.type, "ptr");
+                return p;
+            }
+            char t[32]; new_temp(g, "ptr", t);
+            emit(g, "ADDR", t, node->identifier, "0", node->line);
+            Place p; memset(&p, 0, sizeof(p)); strcpy(p.place, t); strcpy(p.type, "ptr");
+            return p;
+        }
         Place p; memset(&p, 0, sizeof(p));
         strncpy(p.place, node->identifier, sizeof(p.place) - 1);
         strncpy(p.type, sem_expr_type_ident(g, node->identifier), sizeof(p.type) - 1);
@@ -502,6 +557,26 @@ static Place gen_expr(G *g, NovaNode *node) {
     return zero;
 }
 
+/* Expand a struct's fields into the ordered list of leaf-slot offsets,
+ * recursing into nested struct fields (C's flat subobject initialization:
+ * struct C c = {1, 2, 3} fills the innermost fields first). */
+static void struct_leaf_offsets(SemResult *sem, const char *structName, int *out, int *count, int base) {
+    StructDef *st = sem_find_struct(sem, structName);
+    if (!st) return;
+    for (int i = 0; i < st->field_count && *count < 1024; i++) {
+        StructField *f = &st->fields[i];
+        if (strncmp(f->type, "struct ", 7) == 0) {
+            if (!f->is_array) struct_leaf_offsets(sem, f->type + 7, out, count, base + f->offset);
+            continue;
+        }
+        if (f->is_array) {
+            for (int k = 0; k < f->size && *count < 1024; k++) out[(*count)++] = base + f->offset + k;
+            continue;
+        }
+        out[(*count)++] = base + f->offset;
+    }
+}
+
 /* ------------------------------ statements ------------------------------- */
 
 typedef struct { char brk[32]; char cont[32]; int isSwitch; } LoopCtx;
@@ -537,6 +612,31 @@ static void collect_labels(G *g, NovaNode *node) {
 static void emit_var_decl_init(G *g, NovaNode *node) {
     if (node->is_array) {
         int start = node->has_size ? 1 : 0;
+        SymRec *rec = find_any_symbol(g, node->identifier);
+        int cnt = (rec && rec->is_array) ? rec->size : node->child_count;
+        int inits = node->child_count - start;
+        if (inits == 1 && node->children[start]->type == NODE_STRING_LITERAL) {
+            /* char s[N] = "literal": copy the characters (and the NUL when it
+             * fits) into the array cells, then zero-fill the remainder. */
+            const char *str = node->children[start]->string_val;
+            size_t slen = strlen(str);
+            int n = (int)slen + 1; /* chars + NUL */
+            for (int i = 0; i < n && i < cnt; i++) {
+                char idxT[32]; new_temp(g, "ptr", idxT);
+                char istr[16]; snprintf(istr, sizeof(istr), "%d", i);
+                emit(g, "IDX_ADDR", idxT, node->identifier, istr, node->line);
+                char val[32];
+                snprintf(val, sizeof(val), "%d", (i < (int)slen) ? (unsigned char)str[i] : 0);
+                emit(g, "STORE_PTR", "", idxT, val, node->line);
+            }
+            for (int i = n; i < cnt; i++) {
+                char idxT[32]; new_temp(g, "ptr", idxT);
+                char istr[16]; snprintf(istr, sizeof(istr), "%d", i);
+                emit(g, "IDX_ADDR", idxT, node->identifier, istr, node->line);
+                emit(g, "STORE_PTR", "", idxT, "0", node->line);
+            }
+            return;
+        }
         int idx = 0;
         for (int i = start; i < node->child_count; i++, idx++) {
             Place v = gen_expr(g, node->children[i]);
@@ -544,6 +644,35 @@ static void emit_var_decl_init(G *g, NovaNode *node) {
             char istr[16]; snprintf(istr, sizeof(istr), "%d", idx);
             emit(g, "IDX_ADDR", idxT, node->identifier, istr, node->line);
             emit(g, "STORE_PTR", "", idxT, v.place, node->line);
+        }
+        /* C semantics: the remainder of a partially-initialized aggregate is
+         * zero-filled every time the declaration executes. */
+        for (int i = idx; i < cnt; i++) {
+            char idxT[32]; new_temp(g, "ptr", idxT);
+            char istr[16]; snprintf(istr, sizeof(istr), "%d", i);
+            emit(g, "IDX_ADDR", idxT, node->identifier, istr, node->line);
+            emit(g, "STORE_PTR", "", idxT, "0", node->line);
+        }
+        return;
+    }
+    if (node->child_count > 0 && strncmp(node->type_name, "struct ", 7) == 0) {
+        /* struct initializer list: struct P p = {1, 2}; — store each value at
+         * the flattened leaf offset, zero-fill the remaining fields (C's flat
+         * subobject initialization semantics). */
+        int leaves[1024]; int nleaves = 0;
+        struct_leaf_offsets(g->sem, node->type_name + 7, leaves, &nleaves, 0);
+        for (int i = 0; i < node->child_count && i < nleaves; i++) {
+            Place v = gen_expr(g, node->children[i]);
+            char t[32]; new_temp(g, "ptr", t);
+            char off[32]; snprintf(off, sizeof(off), "%d", leaves[i]);
+            emit(g, "ADDR", t, node->identifier, off, node->line);
+            emit(g, "STORE_PTR", "", t, v.place, node->line);
+        }
+        for (int i = node->child_count; i < nleaves; i++) {
+            char t[32]; new_temp(g, "ptr", t);
+            char off[32]; snprintf(off, sizeof(off), "%d", leaves[i]);
+            emit(g, "ADDR", t, node->identifier, off, node->line);
+            emit(g, "STORE_PTR", "", t, "0", node->line);
         }
         return;
     }

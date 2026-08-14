@@ -513,7 +513,7 @@ static NovaNode *parse_single_declarator(P *p, const char *typeName, int line, N
         p_expect(p, TOK_RBRACKET, "']' after array size");
     }
     if (p_match(p, TOK_ASSIGN)) {
-        if (decl->is_array && p_check(p, TOK_LBRACE)) {
+        if ((decl->is_array || strncmp(type, "struct ", 7) == 0) && p_check(p, TOK_LBRACE)) {
             p_advance(p);
             while (!p_check(p, TOK_RBRACE) && !p_check(p, TOK_EOF)) {
                 node_add_child(decl, parse_expression(p));
@@ -840,6 +840,14 @@ static void parse_parameter_list(P *p, NovaNode *func) {
         param->has_type_name = 1;
         if (id) { strncpy(param->identifier, id->lexeme, sizeof(param->identifier) - 1); param->has_identifier = 1; }
         else { strcpy(param->identifier, "<error>"); param->has_identifier = 1; }
+        /* array parameter: int arr[] (optional size is accepted and ignored —
+         * the parameter decays to a pointer, exactly like C) */
+        if (p_check(p, TOK_LBRACKET)) {
+            p_advance(p);
+            while (!p_check(p, TOK_RBRACKET) && !p_check(p, TOK_EOF) && !p_check(p, TOK_COMMA)) p_advance(p);
+            if (p_check(p, TOK_RBRACKET)) p_advance(p);
+            param->is_array = 1;
+        }
         node_add_child(func, param);
         if (p_match(p, TOK_COMMA)) continue;
         break;
@@ -889,15 +897,15 @@ NovaNode *nova_parse(NovaTokenList *tokens, DiagList *diags) {
                 else { strcpy(def->identifier, "<error>"); def->has_identifier = 1; }
                 while (!p_check(p, TOK_RBRACE) && !p_check(p, TOK_EOF)) {
                     NovaToken *ft = p_peek(p);
-                    if (ft->type == TOK_UNION || ft->type == TOK_STRUCT ||
-                        ft->type == TOK_UNSIGNED || ft->type == TOK_SIGNED ||
-                        ft->type == TOK_SHORT || ft->type == TOK_LONG) {
+                    if (ft->type == TOK_UNION || ft->type == TOK_UNSIGNED ||
+                        ft->type == TOK_SIGNED || ft->type == TOK_SHORT ||
+                        ft->type == TOK_LONG) {
                         diag_add(diags, "error", ft->line, ft->column,
                             "'%s' struct fields are not supported in the NOVA C subset", ft->lexeme);
                         skip_declaration(p);
                         continue;
                     }
-                    if (!is_type_token(p) && !is_decl_type_start(p)) {
+                    if (!is_type_token(p) && !is_decl_type_start(p) && p_peek(p)->type != TOK_STRUCT) {
                         diag_add(diags, "error", ft->line, ft->column,
                             "Expected field type in struct but found '%s'", ft->lexeme);
                         skip_declaration(p);
