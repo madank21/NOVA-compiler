@@ -66,8 +66,17 @@ static PlaceInfo place_info(BG *bg, const char *place) {
     if (g) { info.isGlobal = 1; info.slot = g->offset; info.size = g->size; return info; }
     FuncDef *f = sem_find_function(bg->sem, bg->currentFunc);
     if (f) {
+        for (int i = 0; i < f->frame.count; i++) {
+            SymRec *r = &f->frame.items[i];
+            if (strcmp(r->storage, place) == 0) {
+                info.isGlobal = r->isGlobal;
+                info.slot = r->offset;
+                info.size = r->size;
+                return info;
+            }
+        }
         SymRec *r = sem_find_in_frame(f, place);
-        if (r) { info.isGlobal = 0; info.slot = r->offset; info.size = r->size; return info; }
+        if (r) { info.isGlobal = r->isGlobal; info.slot = r->offset; info.size = r->size; return info; }
         /* temp slot */
         int ftIdx = -1;
         for (int i = 0; i < bg->funcTemp_count; i++) {
@@ -130,6 +139,10 @@ static int array_size_of(BG *bg, const char *name) {
     if (g) return g->is_array ? g->size : -1;
     FuncDef *f = sem_find_function(bg->sem, bg->currentFunc);
     if (f) {
+        for (int i = 0; i < f->frame.count; i++) {
+            SymRec *r = &f->frame.items[i];
+            if (strcmp(r->storage, name) == 0) return r->is_array ? r->size : -1;
+        }
         SymRec *r = sem_find_in_frame(f, name);
         if (r) return r->is_array ? r->size : -1;
     }

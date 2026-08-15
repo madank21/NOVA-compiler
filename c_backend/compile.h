@@ -18,6 +18,7 @@ typedef struct {
 
 typedef struct {
     char name[256];
+    char storage[64];   /* unique internal TAC/bytecode place */
     char type[96];
     int is_array;
     int size;
@@ -74,6 +75,7 @@ SymRec *sem_find_global(SemResult *s, const char *name);
 FuncDef *sem_find_function(SemResult *s, const char *name);
 StructDef *sem_find_struct(SemResult *s, const char *name);
 SymRec *sem_find_in_frame(FuncDef *f, const char *name);
+const char *sem_builtin_type(const char *name);
 
 /* --------------------------------- TAC ----------------------------------- */
 

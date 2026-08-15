@@ -21,6 +21,8 @@ endif
 
 COMMON_SRCS := lexer.c parser.c semantic.c tac.c optimizer.c bytecode.c vm.c json.c compile.c diag.c
 COMMON_OBJS := $(COMMON_SRCS:.c=.o)
+ALL_OBJS := $(COMMON_OBJS) main.o server.o native_test.o
+DEPS := $(ALL_OBJS:.o=.d)
 
 all: nova_compiler nova_server
 
@@ -40,12 +42,18 @@ nova_native_test: native_test.o $(COMMON_OBJS)
 test_native: check
 
 %.o: %.c
-	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) $(CPPFLAGS) -MMD -MP -c $< -o $@
+
+-include $(DEPS)
 
 asan:
+	$(MAKE) clean
 	$(MAKE) CFLAGS="-std=c99 -Wall -Wextra -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer" all nova_native_test
 
-clean:
-	rm -f *.o nova_compiler nova_server nova_native_test *.exe
+asan-check: asan
+	./nova_native_test
 
-.PHONY: all check test_native asan clean
+clean:
+	rm -f *.o *.d nova_compiler nova_server nova_native_test *.exe
+
+.PHONY: all check test_native asan asan-check clean
