@@ -33,6 +33,13 @@ static const char *UNSUPPORTED_FNS[] = {
     "clock", "va_start", "va_arg", "va_end", "creal", "cimag", "qsort", "bsearch"
 };
 
+const char *sem_builtin_type(const char *name) {
+    for (int i = 0; i < BUILTIN_COUNT; i++) {
+        if (strcmp(BUILTINS[i].name, name) == 0) return BUILTINS[i].type;
+    }
+    return NULL;
+}
+
 static int is_builtin(const char *name, int *params, const char **type) {
     for (int i = 0; i < BUILTIN_COUNT; i++) {
         if (strcmp(BUILTINS[i].name, name) == 0) {
@@ -120,6 +127,15 @@ static int type_size(SemResult *s, const char *typeName) {
     return 1;
 }
 
+static void assign_local_storage(SemResult *s, FuncDef *f, SymRec *rec) {
+    int conflict = sem_find_global(s, rec->name) != NULL;
+    for (int i = 0; !conflict && i < f->frame.count - 1; i++) {
+        if (strcmp(f->frame.items[i].name, rec->name) == 0) conflict = 1;
+    }
+    if (conflict) snprintf(rec->storage, sizeof(rec->storage), "$L%d", rec->offset);
+    else strncpy(rec->storage, rec->name, sizeof(rec->storage) - 1);
+}
+
 static long long truncate_ll(double v) {
     const double LIM = 9007199254740991.0;
     if (v >= LIM) return 9007199254740991LL;
@@ -146,6 +162,7 @@ SemResult *nova_semantic(NovaNode *ast, DiagList *diags) {
     {
         SymRec *rec = recrec_add(&s->globals);
         strcpy(rec->name, "errno");
+        strcpy(rec->storage, "errno");
         strcpy(rec->type, "int");
         rec->size = 1;
         rec->isGlobal = 1;
@@ -243,12 +260,16 @@ SemResult *nova_semantic(NovaNode *ast, DiagList *diags) {
                     : type_size(s, node->type_name);
                 SymRec *rec = recrec_add(&s->globals);
                 strncpy(rec->name, node->identifier, sizeof(rec->name) - 1);
+                strncpy(rec->storage, node->identifier, sizeof(rec->storage) - 1);
                 strncpy(rec->type, node->type_name, sizeof(rec->type) - 1);
                 rec->is_array = node->is_array;
                 rec->size = size;
                 rec->isGlobal = 1;
                 rec->offset = s->globalSlotCount;
                 s->globalSlotCount += size;
+                node->has_binding = 1;
+                node->binding_offset = rec->offset;
+                node->binding_is_global = 1;
                 push_symbol(s, "global", node->identifier, node->is_array ? "Array" : "Variable",
                             node->type_name, rec->offset, 0);
             }
@@ -274,6 +295,10 @@ SemResult *nova_semantic(NovaNode *ast, DiagList *diags) {
             rec->isParam = 1;
             rec->offset = f->frame_size;
             f->frame_size += 1;
+            assign_local_storage(s, f, rec);
+            pn->has_binding = 1;
+            pn->binding_offset = rec->offset;
+            pn->binding_is_global = 0;
             push_symbol(s, f->name, pn->identifier, "Parameter", pn->type_name, rec->offset, 0);
         }
 
@@ -353,6 +378,7 @@ static void sem_declare_local(SemResult *ss, FuncDef *ff, DiagList *diags, NovaN
         }
         SymRec *grec = recrec_add(&ss->globals);
         strncpy(grec->name, node->identifier, sizeof(grec->name) - 1);
+        strncpy(grec->storage, node->identifier, sizeof(grec->storage) - 1);
         strncpy(grec->type, node->type_name, sizeof(grec->type) - 1);
         grec->is_array = node->is_array;
         grec->size = size;
@@ -361,6 +387,9 @@ static void sem_declare_local(SemResult *ss, FuncDef *ff, DiagList *diags, NovaN
         ss->globalSlotCount += size;
         SymRec *frec = recrec_add(&ff->frame);
         *frec = *grec;
+        node->has_binding = 1;
+        node->binding_offset = grec->offset;
+        node->binding_is_global = 1;
         push_symbol(ss, ff->name, node->identifier, node->is_array ? "Array" : "Variable (static)",
                     node->type_name, grec->offset, 0);
         if (ss->static_count >= ss->static_capacity) {
@@ -377,6 +406,10 @@ static void sem_declare_local(SemResult *ss, FuncDef *ff, DiagList *diags, NovaN
     rec->size = size;
     rec->offset = ff->frame_size;
     ff->frame_size += size;
+    assign_local_storage(ss, ff, rec);
+    node->has_binding = 1;
+    node->binding_offset = rec->offset;
+    node->binding_is_global = 0;
     push_symbol(ss, ff->name, node->identifier, node->is_array ? "Array" : "Variable",
                 node->type_name, rec->offset, 0);
 }

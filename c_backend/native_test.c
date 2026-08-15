@@ -68,6 +68,11 @@ int main(void) {
         { "struct_member", "struct P { int x; }; int main() { struct P p; p.x = 7; printf(\"%d\\n\", p.x); return 0; }", "7\n", 1 },
         { "break_continue", "int main() { int s = 0; for (int i = 0; i < 10; i++) { if (i == 3) continue; if (i == 7) break; s += i; } printf(\"%d\\n\", s); return 0; }", "18\n", 1 },
         { "char_literal", "int main() { char c = 'A'; printf(\"%c %d\\n\", c, c + 1); return 0; }", "A 66\n", 1 },
+        { "scope_shadowing", "int g = 1; int f() { int g = 2; { int g = 3; printf(\"%d \", g); } printf(\"%d \", g); return g; } int main() { int r = f(); printf(\"%d %d\\n\", r, g); return 0; }", "3 2 2 1\n", 1 },
+        { "double_value_types", "double value() { return 3.5; } int main() { double a[2] = {3.5, 5.5}; double *p = a; a[0] /= 2; printf(\"%.6f %.6f %.2f %.2f\\n\", value() / 2, sqrt(2.0) / 2, a[0], p[1] / 2); return 0; }", "1.750000 0.707107 1.75 2.75\n", 1 },
+        { "struct_array_member", "struct S { char text[4]; double nums[2]; int value; }; int main() { struct S s; s.text[0] = 'h'; s.text[1] = 'i'; s.text[2] = 0; s.nums[0] = 3.5; s.nums[1] = 5.5; s.value = 3; int *p = &s.value; *p = 8; printf(\"%s %.2f %.2f %d\\n\", s.text, s.nums[0] / 2, s.nums[1] / 2, s.value); return 0; }", "hi 1.75 2.75 8\n", 1 },
+        { "struct_string_init", "struct S { char text[4]; int value; }; struct S g = {\"ok\", 7}; int main() { struct S s = {\"hi\", 3}; printf(\"%s %d %s %d\\n\", g.text, g.value, s.text, s.value); return 0; }", "ok 7 hi 3\n", 1 },
+        { "pointer_param_same_name", "int sum(int *a, int n) { int total = 0; for (int i = 0; i < n; i++) total += a[i]; return total; } int main() { int a[3] = {1, 2, 3}; printf(\"%d\\n\", sum(a, 3)); return 0; }", "6\n", 1 },
     };
     int nValid = (int)(sizeof(valid) / sizeof(valid[0]));
     for (int i = 0; i < nValid; i++) {
@@ -77,12 +82,7 @@ int main(void) {
         check(nm, r->success == 1, r->success ? NULL : "compile failed");
         if (r->success) {
             snprintf(nm, sizeof(nm), "%s: console", valid[i].name);
-            const char *actual = r->vm ? r->vm->consoleOutput : "";
-            if (strcmp(actual, valid[i].expected) != 0) {
-                char d[512];
-                snprintf(d, sizeof(d), "expected \"%s\", got \"%s\"", valid[i].expected, actual);
-                check(nm, 0, d);
-            } else check(nm, 1, NULL);
+            exact_console(nm, r, valid[i].expected);
         }
         nova_compile_free(r);
     }

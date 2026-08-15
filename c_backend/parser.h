@@ -27,6 +27,10 @@ typedef struct NovaNode {
     int has_size;
     int is_static;
     int is_forward;
+    /* Semantic-only storage binding (not serialized in the AST contract). */
+    int has_binding;
+    int binding_offset;
+    int binding_is_global;
     struct NovaNode **children;
     int child_count;
     int child_capacity;
