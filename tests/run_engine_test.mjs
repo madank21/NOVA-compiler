@@ -312,6 +312,31 @@ const validCases = [
     console: '7\n'
   },
   {
+    name: 'scope_shadowing',
+    code: 'int g = 1; int f() { int g = 2; { int g = 3; printf("%d ", g); } printf("%d ", g); return g; } int main() { int r = f(); printf("%d %d\\n", r, g); return 0; }',
+    console: '3 2 2 1\n'
+  },
+  {
+    name: 'double_value_types',
+    code: 'double value() { return 3.5; } int main() { double a[2] = {3.5, 5.5}; double *p = a; a[0] /= 2; printf("%.6f %.6f %.2f %.2f\\n", value() / 2, sqrt(2.0) / 2, a[0], p[1] / 2); return 0; }',
+    console: '1.750000 0.707107 1.75 2.75\n'
+  },
+  {
+    name: 'struct_array_member_decay',
+    code: 'struct S { char text[4]; double nums[2]; int value; }; int main() { struct S s; s.text[0] = \'h\'; s.text[1] = \'i\'; s.text[2] = 0; s.nums[0] = 3.5; s.nums[1] = 5.5; s.value = 3; int *p = &s.value; *p = 8; printf("%s %.2f %.2f %d\\n", s.text, s.nums[0] / 2, s.nums[1] / 2, s.value); return 0; }',
+    console: 'hi 1.75 2.75 8\n'
+  },
+  {
+    name: 'struct_string_initializer',
+    code: 'struct S { char text[4]; int value; }; struct S g = {"ok", 7}; int main() { struct S s = {"hi", 3}; printf("%s %d %s %d\\n", g.text, g.value, s.text, s.value); return 0; }',
+    console: 'ok 7 hi 3\n'
+  },
+  {
+    name: 'pointer_param_same_name',
+    code: 'int sum(int *a, int n) { int total = 0; for (int i = 0; i < n; i++) total += a[i]; return total; } int main() { int a[3] = {1, 2, 3}; printf("%d\\n", sum(a, 3)); return 0; }',
+    console: '6\n'
+  },
+  {
     name: 'deterministic_rand',
     code: 'int main() { srand(42); printf("%d %d\\n", rand(), rand()); return 0; }',
     console: null, // asserted separately for determinism

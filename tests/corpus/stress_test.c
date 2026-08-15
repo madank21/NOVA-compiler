@@ -26,7 +26,7 @@
     ({ \
         type _result = 0; \
         type _args[] = {__VA_ARGS__}; \
-        for(int _i = 0; _i < sizeof(_args)/sizeof(type); _i++) { \
+        for(size_t _i = 0; _i < sizeof(_args)/sizeof(type); _i++) { \
             _result op##= _args[_i]; \
         } \
         _result; \
@@ -101,7 +101,9 @@ typedef int (*ComplexFunc)(int, ...);
 /* Forward declarations with different calling conventions */
 int complex_recursive(int n) __attribute__((noinline));
 void __attribute__((noreturn)) panic(const char* msg);
-static inline int fast_square(int x) __attribute__((always_inline));
+static inline __attribute__((always_inline, unused)) int fast_square(int x) {
+    return x * x;
+}
 
 /* ============================================
    TEST FUNCTIONS
@@ -207,9 +209,10 @@ void test_control_flow_advanced() {
             printf("Case 2\n");
             // Fallthrough with condition
             if(value < 3) break;
+            __attribute__((fallthrough));
         case 3:
             printf("Case 3\n");
-            // Fallthrough to default
+            __attribute__((fallthrough));
         default:
             printf("Default case\n");
             break;
@@ -640,6 +643,8 @@ void test_atomic() {
    ============================================ */
 
 int main(int argc, char **argv) {
+    (void)argc;
+    (void)argv;
     printf("========================================\n");
     printf("  COMPLEX COMPILER STRESS TEST SUITE\n");
     printf("========================================\n\n");
