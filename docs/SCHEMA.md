@@ -170,12 +170,13 @@ when they occur before VM execution completes normally; the JSON keeps both.
 
 `int`, `char`, `float`, `double` scalars; fixed arrays with initializer lists;
 struct definitions and member access; pointers (`&`, `*`, pointer parameters);
-`if/else`, `while`, `for`, `break`, `continue`, `return`; functions with recursion;
-`printf`/`scanf` with format strings (`%d %i %f %.Nf %c %s %%`); global variables
-with constant initializers. Preprocessor directives are skipped (`#include`,
-`#define`). Not supported (diagnostics will say so): ternary `?:`, `switch`,
-`do/while`, pointer arithmetic beyond indexing, dynamic memory, multi-declarator
-initializers with mixed array/scalar forms.
+`if/else`, `while`, `do/while`, `for`, `switch`/`case`/`default`, `goto`/labels,
+`break`, `continue`, `return`, ternary `?:`, casts, and `sizeof`; functions with
+recursion; `printf`/`scanf` with format strings; global and static variables.
+Preprocessor directives are skipped (`#include`, `#define`) with basic
+conditional-directive handling. Deliberately unsupported constructs produce a
+clear diagnostic: `typedef`, unions, enums, bitfields, function pointers,
+variadic or nested function definitions, dynamic allocation, and libc file I/O.
 
 ### Semantics notes (v1, enforced by the parity suite)
 
@@ -196,7 +197,16 @@ initializers with mixed array/scalar forms.
   member chains (`o.in.a`), and initializer lists for globals and locals
   (`struct P g = {7, 9};`) are supported with C's flat subobject mapping:
   `struct C c = {6, 7, 8}` fills the innermost fields first. Partial struct
-  initializer lists zero-fill the remaining leaves.
+  initializer lists zero-fill the remaining leaves, and a string initializer
+  consumes its complete array field (`struct S s = {"hi", 3}`). Array members
+  decay to their first-element address, so `s.text`, `s.values[i]`, and
+  addresses of scalar members (`&s.value`) have C semantics.
+- **Lexical shadowing.** Block/function locals are bound to unique internal
+  storage slots. Inner declarations correctly shadow outer locals and globals,
+  and the outer binding is restored when its scope ends.
+- **Value types survive code generation.** Double array/pointer elements and
+  double-returning user or math functions retain their type, ensuring `/` uses
+  floating-point rather than truncating integer division.
 - **Types are stored as doubles.** `char`/`float` normalize to `int`/`double`;
   there is no float32 rounding of constants or arithmetic (a documented
   limitation — e.g. `float` literals like `3.14e10` are not rounded to float32).

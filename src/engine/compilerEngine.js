@@ -1461,7 +1461,7 @@ function analyzeSemantics(ast, diags) {
   // built-in global: errno (mutable integer, starts at 0)
   {
     const rec = {
-      name: 'errno', type: 'int', is_array: false, size: 1,
+      name: 'errno', storageName: 'errno', type: 'int', is_array: false, size: 1,
       isGlobal: true, offset: globalSlots.next, isTemp: false, isParam: false, isBuiltinVar: true
     };
     globalSlots.next += 1;
@@ -1501,7 +1501,7 @@ function analyzeSemantics(ast, diags) {
             node, returnType: node.type_name,
             params: node.children.filter((c) => c.type === 'NODE_PARAMETER')
               .map((p) => ({ name: p.identifier, type: p.type_name, is_array: !!p.is_array })),
-            frame: new Map(), frameSize: 0
+            frame: new Map(), storage: new Map(), frameSize: 0
           });
           continue;
         }
@@ -1510,7 +1510,7 @@ function analyzeSemantics(ast, diags) {
       }
       const params = node.children.filter((c) => c.type === 'NODE_PARAMETER')
         .map((p) => ({ name: p.identifier, type: p.type_name, is_array: !!p.is_array }));
-      functions.set(node.identifier, { node, returnType: node.type_name, params, frame: new Map(), frameSize: 0 });
+      functions.set(node.identifier, { node, returnType: node.type_name, params, frame: new Map(), storage: new Map(), frameSize: 0 });
       symbols.push({
         scope: 'global', name: node.identifier, kind: 'Function', type: node.type_name,
         address: '0x0000', params: params.length
@@ -1527,9 +1527,11 @@ function analyzeSemantics(ast, diags) {
                  ? String(node.children[0].string_val).length + 1 : 1)))
         : typeSize(node.type_name);
       const rec = {
-        name: node.identifier, type: node.type_name, is_array: !!node.is_array,
+        name: node.identifier, storageName: node.identifier,
+        type: node.type_name, is_array: !!node.is_array,
         size, isGlobal: true, offset: globalSlots.next, isTemp: false, isParam: false
       };
+      Object.defineProperty(node, '_binding', { value: rec, configurable: true });
       globalSlots.next += size;
       globals.set(node.identifier, rec);
       symbols.push({
@@ -1549,6 +1551,8 @@ function analyzeSemantics(ast, diags) {
     const scopeStack = [new Map()];
     let nextSlot = 0;
     const frame = frec.frame;
+    const storage = frec.storage;
+    const declaredNames = new Set();
 
     const declare = (name, type, node, isParam) => {
       const scope = scopeStack[scopeStack.length - 1];
@@ -1569,10 +1573,16 @@ function analyzeSemantics(ast, diags) {
           diags.add('error', node.line, 1, `Redefinition of global '${name}'`);
           return;
         }
-        const grec = { name, type, is_array: !!node.is_array, size, isGlobal: true, offset: globalSlots.next, isTemp: false, isParam: false, isStaticLocal: true };
+        const grec = {
+          name, storageName: name, type, is_array: !!node.is_array, size,
+          isGlobal: true, offset: globalSlots.next, isTemp: false,
+          isParam: false, isStaticLocal: true
+        };
         globalSlots.next += size;
         globals.set(name, grec);
         scope.set(name, grec);
+        storage.set(grec.storageName, grec);
+        Object.defineProperty(node, '_binding', { value: grec, configurable: true });
         symbols.push({
           scope: fname, name, kind: node.is_array ? 'Array' : 'Variable (static)',
           type, address: '0x' + (grec.offset * 4).toString(16).toUpperCase().padStart(4, '0'), params: 0
@@ -1581,18 +1591,25 @@ function analyzeSemantics(ast, diags) {
         return;
       }
 
-      const rec = { name, type, is_array: !!node.is_array, size, isGlobal: false, offset: nextSlot, isTemp: false, isParam };
+      const storageName = (globals.has(name) || declaredNames.has(name)) ? `$L${nextSlot}` : name;
+      const rec = {
+        name, storageName, type, is_array: !!node.is_array, size,
+        isGlobal: false, offset: nextSlot, isTemp: false, isParam
+      };
       nextSlot += size;
+      declaredNames.add(name);
       scope.set(name, rec);
       frame.set(name, rec);
+      storage.set(storageName, rec);
+      Object.defineProperty(node, '_binding', { value: rec, configurable: true });
       symbols.push({
         scope: fname, name, kind: isParam ? 'Parameter' : (node.is_array ? 'Array' : 'Variable'),
         type, address: '0x' + (rec.offset * 4).toString(16).toUpperCase().padStart(4, '0'), params: 0
       });
     };
 
-    for (const p of frec.params) {
-      declare(p.name, p.type, { line: frec.node.line, is_array: !!p.is_array, children: [] }, true);
+    for (const p of frec.node.children.filter((c) => c.type === 'NODE_PARAMETER')) {
+      declare(p.identifier, p.type_name, p, true);
     }
 
     const lookup = (name) => {
@@ -1844,6 +1861,12 @@ function generateTAC(ast, sem, diags) {
   const instrs = [];
   let tempCount = 0;
   let labelCount = 0;
+  // Resolve metadata only in the function currently being generated. Looking
+  // through every function frame made a declaration in one function affect an
+  // unrelated function that happened to reuse the same identifier.
+  let currentFunction = null;
+  let generatingGlobalInits = false;
+  const bindingScopes = [];
   const tempTypes = new Map(); // temp name -> 'int' | 'double'
   const strings = [];          // string constant pool (printf formats)
 
@@ -1890,12 +1913,12 @@ function generateTAC(ast, sem, diags) {
         // array-to-pointer decay: a bare array name in an expression is the
         // address of its first element (&arr[0]). Array parameters decay
         // differently: their slot already holds the caller's address.
-        if (rec.isParam) return { place: node.identifier, type: 'ptr', isConst: false };
+        if (rec.isParam) return { place: storageNameOf(node.identifier), type: 'ptr', isConst: false };
         const t = newTemp('ptr');
-        emit('ADDR', t, node.identifier, '0', node.line);
+        emit('ADDR', t, storageNameOf(node.identifier), '0', node.line);
         return { place: t, type: 'ptr', isConst: false };
       }
-      return { place: node.identifier, type: semExprType(node), isConst: false };
+      return { place: storageNameOf(node.identifier), type: semExprType(node), isConst: false };
     }
 
     if (node.type === 'NODE_BINARY_OP') {
@@ -2009,12 +2032,16 @@ function generateTAC(ast, sem, diags) {
         const inner = node.children[0];
         if (inner.type === 'NODE_IDENTIFIER') {
           const t = newTemp('ptr');
-          emit('ADDR', t, inner.identifier, '0', inner.line);
+          emit('ADDR', t, storageNameOf(inner.identifier), '0', inner.line);
           return { place: t, type: 'ptr', isConst: false };
         }
         if (inner.type === 'NODE_INDEX') {
           const addr = genIndexAddr(inner);
           return { place: addr, type: 'ptr', isConst: false };
+        }
+        if (inner.type === 'NODE_MEMBER') {
+          const addr = genMemberAddr(inner);
+          if (addr) return { place: addr.place, type: 'ptr', isConst: false };
         }
         const t = newTemp('ptr');
         emit('ADDR', t, '0', '0', node.line);
@@ -2035,14 +2062,21 @@ function generateTAC(ast, sem, diags) {
 
     if (node.type === 'NODE_INDEX') {
       const addr = genIndexAddr(node);
-      const t = newTemp('int');
+      const valueType = indexElementType(node.children[0]);
+      const t = newTemp(valueType);
       emit('LOAD_PTR', t, addr, '', node.line);
-      return { place: t, type: 'int', isConst: false };
+      return { place: t, type: valueType, isConst: false };
     }
 
     if (node.type === 'NODE_MEMBER') {
       const addr = genMemberAddr(node);
       if (!addr) return { place: '0', type: 'int', isConst: true };
+      // Array members decay to their first element's address. Loading here
+      // returned element zero and then treated that value as a pointer for
+      // `s.items[i]` and printf("%s", s.text).
+      if (addr.isArray) {
+        return { place: addr.place, type: addr.fieldType, isConst: false };
+      }
       const t = newTemp(addr.fieldType === 'double' || addr.fieldType === 'float' ? 'double' : 'int');
       emit('LOAD_PTR', t, addr.place, '', node.line);
       return { place: t, type: tempTypes.get(t) || 'int', isConst: false };
@@ -2073,11 +2107,74 @@ function generateTAC(ast, sem, diags) {
   }
 
   function findAnySymbol(name) {
-    if (sem.globals.has(name)) return sem.globals.get(name);
-    for (const [, f] of sem.functions) {
-      if (f.frame.has(name)) return f.frame.get(name);
+    if (!generatingGlobalInits) {
+      for (let i = bindingScopes.length - 1; i >= 0; i--) {
+        if (bindingScopes[i].has(name)) return bindingScopes[i].get(name);
+      }
     }
+    if (sem.globals.has(name)) return sem.globals.get(name);
     return null;
+  }
+
+  const storageNameOf = (name) => {
+    const rec = findAnySymbol(name);
+    return rec && rec.storageName ? rec.storageName : name;
+  };
+
+  const declarationStorage = (node) => {
+    if (generatingGlobalInits) return node.identifier;
+    return node && node._binding && node._binding.storageName
+      ? node._binding.storageName : node.identifier;
+  };
+
+  const normalizedValueType = (type) => {
+    if (type === 'double' || type === 'float') return 'double';
+    if (typeof type === 'string' && type.endsWith('*')) return 'ptr';
+    return 'int';
+  };
+
+  // Resolve member metadata without emitting TAC. This is used for type
+  // propagation, notably so division involving a double array element uses
+  // floating-point rather than truncating integer semantics.
+  function memberFieldInfo(node) {
+    if (!node || node.type !== 'NODE_MEMBER') return null;
+    const base = node.children[0];
+    let structName = null;
+    if (base && base.type === 'NODE_IDENTIFIER') {
+      const rec = findAnySymbol(base.identifier);
+      if (rec && typeof rec.type === 'string' && rec.type.startsWith('struct ')) {
+        structName = rec.type.slice(7);
+      }
+    } else if (base && base.type === 'NODE_MEMBER') {
+      const parent = memberFieldInfo(base);
+      if (parent && !parent.is_array && typeof parent.type === 'string' && parent.type.startsWith('struct ')) {
+        structName = parent.type.slice(7);
+      }
+    }
+    const s = structName ? sem.structs.get(structName) : null;
+    return s && s.fields.has(node.identifier) ? s.fields.get(node.identifier) : null;
+  }
+
+  function indexElementType(base) {
+    if (!base) return 'int';
+    if (base.type === 'NODE_IDENTIFIER') {
+      const rec = findAnySymbol(base.identifier);
+      if (rec) {
+        if (rec.is_array) return normalizedValueType(rec.type);
+        if (typeof rec.type === 'string' && rec.type.endsWith('*')) {
+          return normalizedValueType(rec.type.slice(0, -1));
+        }
+      }
+    } else if (base.type === 'NODE_MEMBER') {
+      const field = memberFieldInfo(base);
+      if (field) {
+        if (field.is_array) return normalizedValueType(field.type);
+        if (typeof field.type === 'string' && field.type.endsWith('*')) {
+          return normalizedValueType(field.type.slice(0, -1));
+        }
+      }
+    }
+    return 'int';
   }
 
   function derefType(ptrNode) {
@@ -2096,12 +2193,12 @@ function generateTAC(ast, sem, diags) {
       const rec = findAnySymbol(base.identifier);
       if (rec && rec.is_array && !rec.isParam) {
         // fixed array: bounds-checked IDX_ADDR on the array slot
-        emit('IDX_ADDR', t, base.identifier, idx.place, node.line);
+        emit('IDX_ADDR', t, storageNameOf(base.identifier), idx.place, node.line);
         return t;
       }
       // pointer variable or array parameter: the slot holds an address.
       // Load its value and index (no bounds check — C pointer semantics).
-      emit('+', t, base.identifier, idx.place, node.line);
+      emit('+', t, storageNameOf(base.identifier), idx.place, node.line);
       return t;
     }
     // pointer-valued expression: evaluate it, then index
@@ -2119,8 +2216,8 @@ function generateTAC(ast, sem, diags) {
         if (s && s.fields.has(node.identifier)) {
           const f = s.fields.get(node.identifier);
           const t = newTemp('ptr');
-          emit('ADDR', t, base.identifier, String(f.offset), node.line);
-          return { place: t, fieldType: f.is_array ? f.type + '*' : f.type };
+          emit('ADDR', t, storageNameOf(base.identifier), String(f.offset), node.line);
+          return { place: t, fieldType: f.is_array ? f.type + '*' : f.type, isArray: !!f.is_array };
         }
       }
     }
@@ -2134,7 +2231,7 @@ function generateTAC(ast, sem, diags) {
           const f = s.fields.get(node.identifier);
           const t = newTemp('ptr');
           emit('+', t, bma.place, String(f.offset), node.line);
-          return { place: t, fieldType: f.is_array ? f.type + '*' : f.type };
+          return { place: t, fieldType: f.is_array ? f.type + '*' : f.type, isArray: !!f.is_array };
         }
       }
     }
@@ -2162,31 +2259,44 @@ function generateTAC(ast, sem, diags) {
         node.identifier, '"str' + idx + '"', String(node.children.length - 1), node.line);
       return { place: '', type: 'int', isConst: false };
     }
-    // user function: push args left-to-right
+    // User function/builtin arguments are pushed left-to-right. Preserve the
+    // declared return type on the result temp; otherwise `sqrt(2.0) / 2` and a
+    // double-returning user function incorrectly selected integer division.
     for (const arg of node.children) {
       const a = genExpr(arg);
       emit('PARAM', '', a.place, '', node.line);
     }
-    const t = newTemp('int');
+    const builtin = BUILTIN_FUNCTIONS.find((b) => b.name === node.identifier);
+    const fn = sem.functions.get(node.identifier);
+    const declaredType = builtin ? builtin.type : (fn ? fn.returnType : 'int');
+    const resultType = normalizedValueType(declaredType);
+    const t = newTemp(resultType);
     emit('CALL', t, node.identifier, String(node.children.length), node.line);
-    return { place: t, type: 'int', isConst: false };
+    return { place: t, type: resultType, isConst: false };
   }
 
   // Compute address place for an lvalue; returns {mode:'direct',name} or {mode:'addr',place}
   function lvalueAddr(node) {
     if (node.type === 'NODE_IDENTIFIER') {
-      return { mode: 'direct', name: node.identifier, line: node.line };
+      return { mode: 'direct', name: storageNameOf(node.identifier), line: node.line };
     }
     if (node.type === 'NODE_INDEX') {
-      return { mode: 'addr', place: genIndexAddr(node), line: node.line };
+      return {
+        mode: 'addr', place: genIndexAddr(node),
+        type: indexElementType(node.children[0]), line: node.line
+      };
     }
     if (node.type === 'NODE_MEMBER') {
       const addr = genMemberAddr(node);
-      return addr ? { mode: 'addr', place: addr.place, line: node.line } : null;
+      return addr ? {
+        mode: 'addr', place: addr.place,
+        type: addr.isArray ? 'ptr' : normalizedValueType(addr.fieldType),
+        line: node.line
+      } : null;
     }
     if (node.type === 'NODE_UNARY_OP' && node.op === '*') {
       const p = genExpr(node.children[0]);
-      return { mode: 'addr', place: p.place, line: node.line };
+      return { mode: 'addr', place: p.place, type: normalizedValueType(derefType(node.children[0])), line: node.line };
     }
     return null;
   }
@@ -2217,7 +2327,7 @@ function generateTAC(ast, sem, diags) {
     if (!lv) return { place: '0', type: 'int' };
     const oldV = lv.mode === 'direct'
       ? { place: lv.name, type: semExprType(target) }
-      : (() => { const t = newTemp('int'); emit('LOAD_PTR', t, lv.place, '', node.line); return { place: t, type: 'int' }; })();
+      : (() => { const type = lv.type || 'int'; const t = newTemp(type); emit('LOAD_PTR', t, lv.place, '', node.line); return { place: t, type }; })();
     const rhs = genExpr(node.children[1]);
     const resType = (isFloatType(oldV.type) || isFloatType(rhs.type)) ? 'double' : 'int';
     const t = newTemp(resType);
@@ -2234,7 +2344,7 @@ function generateTAC(ast, sem, diags) {
     if (!lv) return { place: '0', type: 'int', isConst: true };
     const oldV = lv.mode === 'direct'
       ? { place: lv.name, type: semExprType(target) }
-      : (() => { const t = newTemp('int'); emit('LOAD_PTR', t, lv.place, '', node.line); return { place: t, type: 'int' }; })();
+      : (() => { const type = lv.type || 'int'; const t = newTemp(type); emit('LOAD_PTR', t, lv.place, '', node.line); return { place: t, type }; })();
     const t = newTemp(oldV.type === 'double' ? 'double' : 'int');
     emit(op, t, oldV.place, '1', node.line);
     storeToLvalue(lv, t, node.line);
@@ -2264,6 +2374,7 @@ function generateTAC(ast, sem, diags) {
 
   // Emits initializer code for a variable declaration (arrays or scalar).
   function emitVarDeclInit(node) {
+    const declPlace = declarationStorage(node);
     if (node.is_array) {
       // children[0] = size literal when has_size, rest = initializer values
       const inits = node.has_size ? node.children.slice(1) : node.children.slice(0);
@@ -2276,7 +2387,7 @@ function generateTAC(ast, sem, diags) {
         const n = str.length + 1; // chars + NUL
         const storeByte = (i, ch) => {
           const idxT = newTemp('ptr');
-          emit('IDX_ADDR', idxT, node.identifier, String(i), node.line);
+          emit('IDX_ADDR', idxT, declPlace, String(i), node.line);
           emit('STORE_PTR', '', idxT, String(ch), node.line);
         };
         for (let i = 0; i < n && i < cnt; i++) storeByte(i, i < str.length ? str.charCodeAt(i) : 0);
@@ -2286,22 +2397,22 @@ function generateTAC(ast, sem, diags) {
       inits.forEach((initExpr, i) => {
         const v = genExpr(initExpr);
         const idxT = newTemp('ptr');
-        emit('IDX_ADDR', idxT, node.identifier, String(i), node.line);
+        emit('IDX_ADDR', idxT, declPlace, String(i), node.line);
         emit('STORE_PTR', '', idxT, v.place, node.line);
       });
       // C semantics: the remainder of a partially-initialized aggregate is
       // zero-filled every time the declaration executes.
       for (let i = inits.length; i < cnt; i++) {
         const idxT = newTemp('ptr');
-        emit('IDX_ADDR', idxT, node.identifier, String(i), node.line);
+        emit('IDX_ADDR', idxT, declPlace, String(i), node.line);
         emit('STORE_PTR', '', idxT, '0', node.line);
       }
       return;
     }
     if (node.children.length > 0 && node.type_name && node.type_name.startsWith('struct ')) {
-      // struct initializer list: struct P p = {1, 2}; — store each value at
-      // the flattened leaf offset, zero-fill the remaining fields (C's flat
-      // subobject initialization semantics).
+      // Struct initializer list. Keep array-group metadata alongside each leaf
+      // so a string literal initializes one whole char array subobject before
+      // the next initializer advances to the following field.
       const leaves = [];
       const flatten = (structName, base) => {
         const s = sem.structs.get(structName);
@@ -2312,30 +2423,46 @@ function generateTAC(ast, sem, diags) {
             continue;
           }
           if (f.is_array) {
-            for (let k = 0; k < f.size && leaves.length < 1024; k++) leaves.push(base + f.offset + k);
+            const start = base + f.offset;
+            for (let k = 0; k < f.size && leaves.length < 1024; k++) {
+              leaves.push({ offset: start + k, arrayStart: start, arraySize: f.size });
+            }
             continue;
           }
-          leaves.push(base + f.offset);
+          leaves.push({ offset: base + f.offset, arrayStart: -1, arraySize: 0 });
         }
       };
       flatten(node.type_name.slice(7), 0);
-      const storeLeaf = (i, valPlace) => {
-        if (i >= leaves.length) return;
+      const storeOffset = (offset, valPlace) => {
         const t = newTemp('ptr');
-        emit('ADDR', t, node.identifier, String(leaves[i]), node.line);
+        emit('ADDR', t, declPlace, String(offset), node.line);
         emit('STORE_PTR', '', t, valPlace, node.line);
       };
-      node.children.forEach((initExpr, i) => {
-        if (i >= leaves.length) return;
+      let cursor = 0;
+      for (const initExpr of node.children) {
+        if (cursor >= leaves.length) break;
+        const leaf = leaves[cursor];
+        if (initExpr.type === 'NODE_STRING_LITERAL' &&
+            leaf.arraySize > 0 && leaf.offset === leaf.arrayStart) {
+          const str = String(initExpr.string_val || '');
+          const copied = Math.min(str.length + 1, leaf.arraySize);
+          for (let k = 0; k < copied; k++) {
+            storeOffset(leaf.arrayStart + k, k < str.length ? String(str.charCodeAt(k)) : '0');
+          }
+          for (let k = copied; k < leaf.arraySize; k++) storeOffset(leaf.arrayStart + k, '0');
+          cursor += leaf.arraySize;
+          continue;
+        }
         const v = genExpr(initExpr);
-        storeLeaf(i, v.place);
-      });
-      for (let i = node.children.length; i < leaves.length; i++) storeLeaf(i, '0');
+        storeOffset(leaf.offset, v.place);
+        cursor++;
+      }
+      for (; cursor < leaves.length; cursor++) storeOffset(leaves[cursor].offset, '0');
       return;
     }
     if (node.children.length > 0) {
       const v = genExpr(node.children[0]);
-      emit('=', node.identifier, v.place, '', node.line);
+      emit('=', declPlace, v.place, '', node.line);
     }
   }
 
@@ -2346,15 +2473,26 @@ function generateTAC(ast, sem, diags) {
     emitVarDeclInit(node);
   }
 
+  function bindDeclaration(node) {
+    if (!node || !node._binding || bindingScopes.length === 0) return;
+    bindingScopes[bindingScopes.length - 1].set(node.identifier, node._binding);
+  }
+
   function genStmt(node) {
     if (!node || node.type === 'NODE_EMPTY' || node.type === 'NODE_ERROR') return;
 
     if (node.type === 'NODE_DECL_LIST') { node.children.forEach(genStmt); return; }
 
-    if (node.type === 'NODE_VAR_DECL') { genVarDecl(node); return; }
+    if (node.type === 'NODE_VAR_DECL') {
+      bindDeclaration(node); // a C declarator is in scope for its initializer
+      genVarDecl(node);
+      return;
+    }
 
     if (node.type === 'NODE_COMPOUND_STMT') {
+      bindingScopes.push(new Map());
       node.children.forEach(genStmt);
+      bindingScopes.pop();
       return;
     }
 
@@ -2459,6 +2597,7 @@ function generateTAC(ast, sem, diags) {
     }
 
     if (node.type === 'NODE_FOR_STMT') {
+      bindingScopes.push(new Map());
       const [init, cond, incr, body] = node.children;
       const lStart = newLabel();
       const lStep = newLabel();
@@ -2476,6 +2615,7 @@ function generateTAC(ast, sem, diags) {
       emit('GOTO', lStart, '', '', node.line);
       emit('LABEL', lEnd, '', '', node.line);
       loopStack.pop();
+      bindingScopes.pop();
       return;
     }
 
@@ -2510,6 +2650,7 @@ function generateTAC(ast, sem, diags) {
   // Static locals were promoted to global storage; their initializers also run
   // here (exactly once), never on each call.
   function emitGlobalInits() {
+    generatingGlobalInits = true;
     for (const top of ast.children) {
       const decls = top.type === 'NODE_DECL_LIST' ? top.children : [top];
       for (const d of decls) {
@@ -2520,11 +2661,16 @@ function generateTAC(ast, sem, diags) {
     for (const d of (sem.staticDecls || [])) {
       emitVarDeclInit(d);
     }
+    generatingGlobalInits = false;
   }
 
   for (const top of ast.children) {
     if (top.type !== 'NODE_FUNCTION_DEF') continue;
     if (top.is_forward) continue; // forward declaration — no body
+    currentFunction = top.identifier;
+    bindingScopes.length = 0;
+    bindingScopes.push(new Map());
+    for (const param of top.children.filter((c) => c.type === 'NODE_PARAMETER')) bindDeclaration(param);
     emit('FUNC_BEGIN', top.identifier, '', '', top.line);
     labelMap = new Map();
     const body = top.children.find((c) => c.type !== 'NODE_PARAMETER');
@@ -2537,6 +2683,8 @@ function generateTAC(ast, sem, diags) {
       emit('RETURN', '', top.identifier === 'main' ? '0' : '', '', top.line);
     }
     emit('FUNC_END', top.identifier, '', '', top.line);
+    bindingScopes.length = 0;
+    currentFunction = null;
   }
 
   return { instrs, tempTypes, strings, tempCount, labelCount };
@@ -2714,9 +2862,13 @@ function generateBytecode(optTac, sem, tempTypes, strings) {
     }
     const f = sem.functions.get(currentFunc.name);
     if (f) {
+      if (f.storage && f.storage.has(place)) {
+        const r = f.storage.get(place);
+        return { isGlobal: !!r.isGlobal, slot: r.offset, size: r.size };
+      }
       if (f.frame.has(place)) {
         const r = f.frame.get(place);
-        return { isGlobal: false, slot: r.offset, size: r.size };
+        return { isGlobal: !!r.isGlobal, slot: r.offset, size: r.size };
       }
       let temps = tempSlots.get(currentFunc.name);
       if (!temps) { temps = new Map(); tempSlots.set(currentFunc.name, temps); }
@@ -2752,6 +2904,10 @@ function generateBytecode(optTac, sem, tempTypes, strings) {
       return g.is_array ? g.size : -1;
     }
     const f = sem.functions.get(currentFunc.name);
+    if (f && f.storage && f.storage.has(name)) {
+      const r = f.storage.get(name);
+      return r.is_array ? r.size : -1;
+    }
     if (f && f.frame.has(name)) {
       const r = f.frame.get(name);
       return r.is_array ? r.size : -1;
