@@ -17,6 +17,8 @@ optimizer → bytecode → stack VM — and visualizes every phase.
 
 ## Quick start
 
+Requires Node.js `^20.19.0` or `>=22.12.0`.
+
 ```bash
 npm install
 npm run dev          # http://localhost:3000  (browser engine by default)
@@ -41,19 +43,23 @@ by default; override with `NOVA_HOST` / `NOVA_PORT`.
 
 | Command | What it runs |
 |---|---|
-| `npm run test:engine` | 539 assertions on the browser engine (node, zero deps) |
-| `npm run test:c-backend` | 111 assertions on the native backend (`make check`) |
-| `npm run test:parity` | Deep-compares JS vs C JSON across 63 programs |
+| `npm run test:engine` | 579 assertions on the browser engine (node, zero deps) |
+| `npm run test:c-backend` | 121 assertions on the native backend (`make check`) |
+| `npm run test:parity` | Deep-compares JS vs C JSON across 68 programs |
+| `npm run test:gcc` | Compares both engines byte-for-byte with GCC across 16 programs |
+| `npm run test:stress` | Builds the GNU C stress corpus with `-Werror` and runs all 12 suites |
 | `npm test` | engine + parity |
-| `npm run test:all` | engine + native + parity |
+| `npm run test:all` | engine + native + parity + GCC oracle + stress corpus |
 
 The parity test is the key guarantee: for every program it compiles with both
 engines and deep-compares the full result (tokens, AST, symbol table, TAC,
 optimized TAC, metrics, bytecode, VM trace, console output, diagnostics). It
-currently reports **945 fields compared, 0 mismatches**.
+currently reports **1,020 fields compared, 0 mismatches**. The GCC oracle adds
+an independent correctness check so a bug mirrored in both engines cannot pass
+on parity alone.
 
 The native backend also builds clean under AddressSanitizer + UBSan
-(`cd c_backend && make asan && ./nova_native_test`).
+(`cd c_backend && make asan-check`).
 
 ## Docker
 

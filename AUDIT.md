@@ -451,3 +451,46 @@ New parity corpus programs: `nested_struct`, `struct_init`, `struct_nested_init`
 Known limitation (documented in `docs/SCHEMA.md`): there is no float32
 precision — `float` variables behave as `double`, so constants that need
 float32 rounding (`float c = 3.14e10;`) keep the full double value.
+
+---
+
+## Addendum — differential hardening follow-up (2026-08-15)
+
+A second GCC-guided pass found five shared miscompilations that parity alone
+could not detect. They are fixed in both engines and covered by browser,
+native, parity, and independent GCC-oracle tests.
+
+| # | Symptom | Root cause | Fix |
+|---|---|---|---|
+| 12 | `int sum(int *a, ...)` could treat a same-named array from another function as the parameter | TAC metadata lookup searched every function frame rather than the active function | Resolve declarations in the active function and lexical scope only |
+| 13 | `s.text`, `s.values[i]`, and `&s.value` used element zero or address zero | Array members were loaded instead of decayed; unary `&` omitted member lvalues | Preserve member-array metadata, decay to the field address, and accept member addresses |
+| 14 | `double_fn()/2`, `sqrt(2.0)/2`, and `double_array[i]/2` truncated to integers | CALL/index/lvalue temps were unconditionally typed `int` | Propagate declared function, builtin, pointer, array-element, and lvalue types through TAC |
+| 15 | `struct S { char text[4]; int n; } s = {"hi", 3};` initialized `n` incorrectly | Flat leaf mapping treated the string-pool address as one scalar leaf | Track aggregate array boundaries; copy and pad the whole string field before advancing |
+| 16 | Inner locals permanently replaced outer locals/globals (`3 3 3` vs GCC's `3 2 1`) | Bytecode places were name-only and semantic frame maps retained only the latest name | Assign unique internal storage places and maintain lexical binding stacks during codegen |
+
+The stress corpus was also made genuinely warning-clean: its macro loop now
+uses `size_t`, the declared inline helper is defined, intentional switch
+fallthrough is annotated, and `main` explicitly consumes its arguments. The new
+`npm run test:stress` compiles with `-Wall -Wextra -Werror`, runs all 12 suites,
+and requires the completion marker and exit code 0.
+
+A permanent independent oracle (`npm run test:gcc`) now compiles 16 deterministic
+subset programs with real GCC and compares both NOVA console outputs
+byte-for-byte. This complements parity: agreement between two mirrored engines
+is no longer treated as sufficient evidence of correctness.
+
+The frontend toolchain was also moved from vulnerable Vite 5/esbuild releases
+to Vite 8.2 + React plugin 6.0; `npm audit` now reports zero vulnerabilities and
+the production bundle is smaller.
+
+### Current verification
+
+| Check | Result |
+|---|---|
+| `npm run test:engine` | 579 passed, 0 failed |
+| `cd c_backend && make check` | 121 passed, 0 failed |
+| `cd c_backend && make asan-check` | 121 passed under ASan + UBSan |
+| `npm run test:parity` | **1,020 fields compared, 0 mismatches** (68 programs) |
+| `npm run test:gcc` | **16/16** browser/native outputs match GCC byte-for-byte |
+| `npm run test:stress` | warning-free `-Werror` build, 12/12 suites, exit 0 |
+| `npm run build` / `npm audit` | Vite 8 production build passes / 0 vulnerabilities |
